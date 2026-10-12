@@ -18,12 +18,14 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.OpenableColumns
+import android.text.InputType
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -238,7 +240,8 @@ class MainActivity : ComponentActivity() {
             isFillViewport = false
             addView(
                 horizontal,
-                ScrollView.LayoutParams(
+                // ✅ الإصلاح: FrameLayout.LayoutParams بدل ScrollView.LayoutParams
+                FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT
                 )
@@ -526,7 +529,9 @@ class MainActivity : ComponentActivity() {
         val input = EditText(this).apply {
             setText(clip.name)
             setSelection(text.length)
-            singleLine = true
+            // ✅ الإصلاح: بدل singleLine = true
+            maxLines = 1
+            inputType = InputType.TYPE_CLASS_TEXT
         }
 
         AlertDialog.Builder(this)
@@ -1132,7 +1137,6 @@ class MainActivity : ComponentActivity() {
                 paint.color = WHITE
                 paint.textSize = dp(11f).toFloat()
 
-                // ✅ الإصلاح: تحويل top + dp(14f) إلى Float
                 canvas.drawText(
                     clip.name.take(20),
                     x1 + dp(6f),
@@ -1310,7 +1314,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // ✅ الإصلاح: توقيع الدالة Array<String> بدل Array<out String>
     override fun onRequestPermissionsResult(
         requestCode: Int,
         permissions: Array<String>,
