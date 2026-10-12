@@ -1,9 +1,11 @@
 package com.sahlaudio
 
+import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -15,18 +17,24 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.OpenableColumns
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
-import android.widget.*
-import android.widget.FrameLayout
+import android.widget.Button
+import android.widget.EditText
+import android.widget.HorizontalScrollView
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.SeekBar
+import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.core.content.ContextCompat
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import kotlin.math.max
 import kotlin.math.min
 
@@ -36,6 +44,11 @@ private const val GREEN = 0xFF63D69A.toInt()
 private const val GOLD = 0xFFE8C879.toInt()
 private const val WHITE = 0xFFF2F5F2.toInt()
 private const val MUTED = 0xFF9BAAA0.toInt()
+
+private const val REQUEST_AUDIO = 1001
+private const val REQUEST_IMPORT_PROJECT = 1002
+private const val REQUEST_EXPORT_PROJECT = 1003
+private const val REQUEST_MICROPHONE = 1004
 
 data class AudioClip(
     val id: Long,
@@ -50,7 +63,9 @@ data class AudioClip(
     var muted: Boolean = false,
     var color: Int = 0xFF276B4B.toInt()
 ) {
-    fun lengthMs(): Long = max(0L, trimEndMs - trimStartMs)
+    fun lengthMs(): Long =
+        (trimEndMs - trimStartMs).coerceAtLeast(0L)
+
     fun endMs(): Long = startMs + lengthMs()
 }
 
@@ -59,15 +74,16 @@ class MainActivity : ComponentActivity() {
     private lateinit var root: LinearLayout
     private lateinit var timeline: TimelineView
     private lateinit var horizontal: HorizontalScrollView
-    private lateinit var vertical: ScrollView
-    private lateinit var playLabel: TextView
     private lateinit var status: TextView
+    private lateinit var playLabel: TextView
+    private lateinit var volumeSeek: SeekBar
 
     private val clips = mutableListOf<AudioClip>()
     private var tracks = 3
     private var playheadMs = 0L
     private var zoom = 70f
     private var selectedId: Long? = null
+
     private var player: MediaPlayer? = null
     private var recorder: MediaRecorder? = null
     private var recordingFile: File? = null
@@ -76,35 +92,17 @@ class MainActivity : ComponentActivity() {
     private var isRecording = false
 
     private val handler = Handler(Looper.getMainLooper())
-    private val undoStack = ArrayDeque<String>()
-    private val redoStack = ArrayDeque<String>()
-
-    private val pickAudio = 1001
-    private val exportProject = 1002
-    private val importProject = 1003
-    private val exportWav = 1004
+    private val undoStack = java.util.ArrayDeque<String>()
+    private val redoStack = java.util.ArrayDeque<String>()
 
     private val prefs by lazy {
         getSharedPreferences("sahl_audio_project", Context.MODE_PRIVATE)
     }
 
-    private fun dp(v: Float): Int =
-        (v * resources.displayMetrics.density).toInt()
+    private fun dp(value: Float): Int =
+        (value * resources.displayMetrics.density).toInt()
 
-    private fun button(
-        text: String,
-        action: () -> Unit
-    ): Button {
-        return Button(this).apply {
-            this.text = text
-            setTextColor(WHITE)
-            setBackgroundColor(PANEL)
-            isAllCaps = false
-            setOnClickListener { action() }
-        }
-    }
-
-    private fun label(
+    private fun makeLabel(
         text: String,
         size: Float = 14f,
         color: Int = WHITE
@@ -114,14 +112,35 @@ class MainActivity : ComponentActivity() {
             textSize = size
             setTextColor(color)
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(8f), dp(4f), dp(8f), dp(4f))
+            setPadding(dp(7f), dp(3f), dp(7f), dp(3f))
         }
     }
 
+    private fun makeButton(
+        text: String,
+        action: () -> Unit
+    ): Button {
+        return Button(this).apply {
+            this.text = text
+            isAllCaps = false
+            setTextColor(WHITE)
+            setBackgroundColor(PANEL)
+            setOnClickListener { action() }
+        }
+    }
+
+    private fun makeRow(): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
         window.statusBarColor = BG
         window.navigationBarColor = BG
+
         buildUi()
         restoreLocalProject()
     }
@@ -130,110 +149,82 @@ class MainActivity : ComponentActivity() {
         root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(BG)
-            setPadding(dp(8f), dp(8f), dp(8f), dp(8f))
+            setPadding(dp(6f), dp(6f), dp(6f), dp(6f))
         }
 
-        val heading = label("بسم الله الرحمن الرحيم", 18f, GOLD)
-        root.addView(heading, LinearLayout.LayoutParams(-1, dp(30f)))
-
-        val appHeading = label(
-            "سهل الصوت  •  محرر صوت متعدد المسارات",
-            19f,
-            GREEN
+        root.addView(
+            makeLabel("بسم الله الرحمن الرحيم", 17f, GOLD),
+            LinearLayout.LayoutParams(-1, dp(30f))
         )
-        root.addView(appHeading, LinearLayout.LayoutParams(-1, dp(42f)))
 
-        status = label("أضف ملفًا صوتيًا لبدء المشروع", 12f, MUTED)
+        root.addView(
+            makeLabel("سهل الصوت • محرر صوت متعدد المسارات", 18f, GREEN),
+            LinearLayout.LayoutParams(-1, dp(40f))
+        )
+
+        status = makeLabel("أضف ملفًا صوتيًا لبدء المشروع", 12f, MUTED)
         root.addView(status, LinearLayout.LayoutParams(-1, dp(32f)))
 
-        val firstRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-        }
-        firstRow.addView(button("＋ إضافة صوت") { chooseAudio() })
-        firstRow.addView(button("▶ تشغيل") { togglePlayback() })
-        firstRow.addView(button("■ إيقاف") { stopPlayback() })
-        root.addView(firstRow)
+        val row1 = makeRow()
+        row1.addView(makeButton("＋ إضافة صوت") { chooseAudio() })
+        row1.addView(makeButton("▶ تشغيل") { togglePlayback() })
+        row1.addView(makeButton("■ إيقاف") { stopPlayback() })
+        root.addView(row1)
 
-        val secondRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-        }
-        secondRow.addView(button("✂ تقسيم") { splitSelected() })
-        secondRow.addView(button("⧉ تكرار") { duplicateSelected() })
-        secondRow.addView(button("حذف") { deleteSelected() })
-        root.addView(secondRow)
+        val row2 = makeRow()
+        row2.addView(makeButton("✂ تقسيم") { splitSelected() })
+        row2.addView(makeButton("⧉ تكرار") { duplicateSelected() })
+        row2.addView(makeButton("حذف") { deleteSelected() })
+        root.addView(row2)
 
-        val clipToolsRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-        }
-        clipToolsRow.addView(button("✎ إعادة تسمية") { renameSelected() })
-        clipToolsRow.addView(button("🎨 لون المقطع") { chooseClipColor() })
-        clipToolsRow.addView(button("⏮ بداية المقطع") { jumpToSelectedStart() })
-        root.addView(clipToolsRow)
+        val row3 = makeRow()
+        row3.addView(makeButton("إعادة تسمية") { renameSelected() })
+        row3.addView(makeButton("لون المقطع") { chooseClipColor() })
+        row3.addView(makeButton("بداية المقطع") { jumpToSelectedStart() })
+        root.addView(row3)
 
-        val thirdRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-        }
-        thirdRow.addView(button("＋ مسار") {
+        val row4 = makeRow()
+        row4.addView(makeButton("＋ مسار") {
             rememberUndo()
-            tracks++
+            tracks = (tracks + 1).coerceAtMost(20)
             refreshTimeline()
+            saveLocalProject()
         })
-        thirdRow.addView(button("↶ تراجع") { undo() })
-        thirdRow.addView(button("↷ إعادة") { redo() })
-        root.addView(thirdRow)
+        row4.addView(makeButton("↶ تراجع") { undo() })
+        row4.addView(makeButton("↷ إعادة") { redo() })
+        root.addView(row4)
 
-        val zoomRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-        }
-        zoomRow.addView(button("− تصغير") {
+        val zoomRow = makeRow()
+        zoomRow.addView(makeButton("−") {
             zoom = (zoom / 1.25f).coerceAtLeast(8f)
             refreshTimeline()
         })
-        zoomRow.addView(label("التكبير", 13f, GOLD))
-        zoomRow.addView(button("＋ تكبير") {
+        zoomRow.addView(makeLabel("التكبير", 13f, GOLD))
+        zoomRow.addView(makeButton("＋") {
             zoom = (zoom * 1.25f).coerceAtMost(240f)
             refreshTimeline()
         })
         root.addView(zoomRow)
 
-        val fileRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-        }
-        fileRow.addView(button("حفظ المشروع") { saveLocalProject() })
-        fileRow.addView(button("تصدير المشروع") { createProjectFile() })
-        fileRow.addView(button("استيراد مشروع") { openProjectFile() })
-        root.addView(fileRow)
+        val projectRow = makeRow()
+        projectRow.addView(makeButton("حفظ") { saveLocalProject() })
+        projectRow.addView(makeButton("تصدير المشروع") { exportProject() })
+        projectRow.addView(makeButton("استيراد مشروع") { importProject() })
+        root.addView(projectRow)
 
-        val exportRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-        }
-        exportRow.addView(button("تصدير WAV") { startWavExport() })
-        exportRow.addView(button("🎙 تسجيل") { toggleRecording() })
-        root.addView(exportRow)
+        val recordingRow = makeRow()
+        recordingRow.addView(makeButton("🎙 تسجيل") { toggleRecording() })
+        root.addView(recordingRow)
 
-        playLabel = label("موضع التشغيل: 00:00.000", 13f, GOLD)
-        root.addView(playLabel, LinearLayout.LayoutParams(-1, dp(32f)))
-
-        vertical = ScrollView(this).apply {
-            isFillViewport = false
-            setBackgroundColor(0xFF0C120F.toInt())
-        }
+        playLabel = makeLabel("موضع التشغيل: 00:00.000", 13f, GOLD)
+        root.addView(playLabel, LinearLayout.LayoutParams(-1, dp(30f)))
 
         horizontal = HorizontalScrollView(this).apply {
-            isFillViewport = false
             isHorizontalScrollBarEnabled = true
             setBackgroundColor(0xFF0C120F.toInt())
         }
 
         timeline = TimelineView(this)
-
         horizontal.addView(
             timeline,
             ViewGroup.LayoutParams(
@@ -242,38 +233,35 @@ class MainActivity : ComponentActivity() {
             )
         )
 
-        vertical.addView(
-            horizontal,
-            FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
+        val vertical = ScrollView(this).apply {
+            setBackgroundColor(0xFF0C120F.toInt())
+            isFillViewport = false
+            addView(
+                horizontal,
+                ScrollView.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                )
             )
-        )
+        }
 
         root.addView(vertical, LinearLayout.LayoutParams(0, 0, 1f))
 
-        val editRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-        }
-        editRow.addView(button("قص البداية عند المؤشر") {
-            trimStartAtPlayhead()
-        })
-        editRow.addView(button("قص النهاية عند المؤشر") {
-            trimEndAtPlayhead()
-        })
+        val editRow = makeRow()
+        editRow.addView(makeButton("قص البداية") { trimStartAtPlayhead() })
+        editRow.addView(makeButton("قص النهاية") { trimEndAtPlayhead() })
         root.addView(editRow)
 
         val volumeRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        volumeRow.addView(label("صوت المقطع", 12f))
 
-        val volume = SeekBar(this).apply {
+        volumeRow.addView(makeLabel("مستوى الصوت", 12f))
+
+        volumeSeek = SeekBar(this).apply {
             max = 100
             progress = 100
-
             setOnSeekBarChangeListener(
                 object : SeekBar.OnSeekBarChangeListener {
                     override fun onProgressChanged(
@@ -281,28 +269,66 @@ class MainActivity : ComponentActivity() {
                         progress: Int,
                         fromUser: Boolean
                     ) {
-                        if (fromUser) {
-                            clips.find { it.id == selectedId }?.let {
-                                rememberUndo()
-                                it.volume = progress / 100f
-                                refreshTimeline()
-                            }
-                        }
+                        if (!fromUser) return
+
+                        val clip = selectedClip() ?: return
+                        clip.volume = progress / 100f
+                        refreshTimeline()
                     }
 
-                    override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+                    override fun onStartTrackingTouch(seekBar: SeekBar?) {
+                        rememberUndo()
+                    }
 
-                    override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+                    override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                        saveLocalProject()
+                    }
                 }
             )
         }
 
-        volumeRow.addView(volume, LinearLayout.LayoutParams(0, dp(42f), 1f))
-        volumeRow.addView(button("كتم/إلغاء الكتم") { toggleMute() })
+        volumeRow.addView(
+            volumeSeek,
+            LinearLayout.LayoutParams(0, dp(42f), 1f)
+        )
+
+        volumeRow.addView(makeButton("كتم/إلغاء") { toggleMute() })
         root.addView(volumeRow)
 
         setContentView(root)
     }
+
+    private fun showStatus(message: String) {
+        status.text = message
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+    }
+
+    private fun formatTime(ms: Long): String {
+        val safe = ms.coerceAtLeast(0L)
+        val minutes = safe / 60_000L
+        val seconds = (safe / 1000L) % 60L
+        val millis = safe % 1000L
+        return "%02d:%02d.%03d".format(minutes, seconds, millis)
+    }
+
+    private fun projectEndMs(): Long =
+        max(10_000L, clips.maxOfOrNull { it.endMs() } ?: 10_000L)
+
+    private fun selectedClip(): AudioClip? =
+        clips.firstOrNull { it.id == selectedId }
+
+    private fun refreshTimeline() {
+        timeline.invalidate()
+        timeline.requestLayout()
+
+        playLabel.text = "موضع التشغيل: ${formatTime(playheadMs)}"
+
+        selectedClip()?.let { clip ->
+            status.text = "${clip.name} • المسار ${clip.track + 1}"
+            volumeSeek.progress = (clip.volume * 100).toInt().coerceIn(0, 100)
+        }
+    }
+
     private fun chooseAudio() {
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
@@ -310,97 +336,16 @@ class MainActivity : ComponentActivity() {
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
         }
-        startActivityForResult(intent, pickAudio)
-    }
 
-    @Deprecated("Activity result compatibility")
-    override fun onActivityResult(
-        requestCode: Int,
-        resultCode: Int,
-        data: Intent?
-    ) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (resultCode != Activity.RESULT_OK || data?.data == null) return
-        val uri = data.data!!
-
-        when (requestCode) {
-            pickAudio -> {
-                try {
-                    contentResolver.takePersistableUriPermission(
-                        uri,
-                        Intent.FLAG_GRANT_READ_URI_PERMISSION
-                    )
-                } catch (_: Exception) {}
-
-                val duration = getDuration(uri)
-                if (duration <= 0L) {
-                    showStatus("تعذر قراءة مدة الملف الصوتي")
-                    return
-                }
-
-                rememberUndo()
-                val clip = AudioClip(
-                    id = System.nanoTime(),
-                    uri = uri.toString(),
-                    name = queryName(uri),
-                    track = 0,
-                    startMs = playheadMs,
-                    durationMs = duration
-                )
-                clips.add(clip)
-                selectedId = clip.id
-                tracks = max(tracks, clip.track + 1)
-                refreshTimeline()
-                showStatus("تمت إضافة: ${clip.name}")
-                saveLocalProject()
-            }
-
-            importProject -> {
-                try {
-                    val json = contentResolver.openInputStream(uri)
-                        ?.bufferedReader()?.use { it.readText() }
-                    if (json != null) loadProjectJson(json)
-                } catch (e: Exception) {
-                    showStatus("تعذر فتح المشروع: ${e.message}")
-                }
-            }
-
-            exportProject -> {
-                try {
-                    contentResolver.openOutputStream(uri)?.bufferedWriter()?.use {
-                        it.write(projectJson())
-                    }
-                    showStatus("تم تصدير ملف المشروع")
-                } catch (e: Exception) {
-                    showStatus("فشل تصدير المشروع: ${e.message}")
-                }
-            }
-
-            exportWav -> {
-                Thread {
-                    try {
-                        val out = contentResolver.openOutputStream(uri)
-                            ?: throw IllegalStateException("تعذر فتح ملف الحفظ")
-                        out.use { exportMixedWav(it) }
-                        runOnUiThread { showStatus("اكتمل تصدير WAV") }
-                    } catch (e: Exception) {
-                        runOnUiThread {
-                            showStatus("فشل التصدير: ${e.message}")
-                        }
-                    }
-                }.start()
-            }
-        }
+        startActivityForResult(intent, REQUEST_AUDIO)
     }
 
     private fun queryName(uri: Uri): String {
         return try {
             contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-                val index = cursor.getColumnIndex(
-                    android.provider.OpenableColumns.DISPLAY_NAME
-                )
+                val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
                 if (cursor.moveToFirst() && index >= 0) {
-                    cursor.getString(index)
+                    cursor.getString(index) ?: "مقطع صوتي"
                 } else {
                     "مقطع صوتي"
                 }
@@ -411,109 +356,189 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun getDuration(uri: Uri): Long {
+        val retriever = MediaMetadataRetriever()
+
         return try {
-            val retriever = MediaMetadataRetriever()
             retriever.setDataSource(this, uri)
-            val duration = retriever.extractMetadata(
+            retriever.extractMetadata(
                 MediaMetadataRetriever.METADATA_KEY_DURATION
             )?.toLongOrNull() ?: 0L
-            retriever.release()
-            duration
         } catch (_: Exception) {
             0L
+        } finally {
+            try {
+                retriever.release()
+            } catch (_: Exception) {
+            }
         }
     }
 
-    private fun projectEndMs(): Long {
-        return max(
-            10_000L,
-            clips.maxOfOrNull { it.endMs() } ?: 10_000L
-        )
-    }
+    @Deprecated("Activity result compatibility")
+    override fun onActivityResult(
+        requestCode: Int,
+        resultCode: Int,
+        data: Intent?
+    ) {
+        super.onActivityResult(requestCode, resultCode, data)
 
-    private fun refreshTimeline() {
-        timeline.invalidate()
-        timeline.requestLayout()
-        playLabel.text = "موضع التشغيل: ${formatTime(playheadMs)}"
-        val selected = clips.find { it.id == selectedId }
-        if (selected != null) {
-            status.text = "${selected.name} • المسار ${selected.track + 1}"
+        if (resultCode != Activity.RESULT_OK) return
+        val uri = data?.data ?: return
+
+        when (requestCode) {
+            REQUEST_AUDIO -> {
+                try {
+                    contentResolver.takePersistableUriPermission(
+                        uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                } catch (_: Exception) {
+                }
+
+                val duration = getDuration(uri)
+                if (duration <= 0L) {
+                    showStatus("تعذرت قراءة مدة الملف الصوتي")
+                    return
+                }
+
+                rememberUndo()
+
+                val clip = AudioClip(
+                    id = System.nanoTime(),
+                    uri = uri.toString(),
+                    name = queryName(uri),
+                    track = 0,
+                    startMs = playheadMs,
+                    durationMs = duration
+                )
+
+                clips.add(clip)
+                selectedId = clip.id
+                refreshTimeline()
+                saveLocalProject()
+                showStatus("تمت إضافة ${clip.name}")
+            }
+
+            REQUEST_IMPORT_PROJECT -> {
+                try {
+                    val json = contentResolver.openInputStream(uri)
+                        ?.bufferedReader()
+                        ?.use { it.readText() }
+
+                    if (json.isNullOrBlank()) {
+                        showStatus("ملف المشروع فارغ")
+                    } else {
+                        rememberUndo()
+                        loadProjectJson(json)
+                        saveLocalProject()
+                        showStatus("تم استيراد المشروع")
+                    }
+                } catch (e: Exception) {
+                    showStatus("تعذر استيراد المشروع: ${e.message}")
+                }
+            }
+
+            REQUEST_EXPORT_PROJECT -> {
+                try {
+                    contentResolver.openOutputStream(uri)?.bufferedWriter()?.use {
+                        it.write(projectJson())
+                    } ?: throw IllegalStateException("تعذر فتح الملف")
+
+                    showStatus("تم تصدير المشروع")
+                } catch (e: Exception) {
+                    showStatus("فشل التصدير: ${e.message}")
+                }
+            }
         }
-    }
-
-    private fun showStatus(message: String) {
-        status.text = message
-    }
-
-    private fun formatTime(ms: Long): String {
-        val safe = ms.coerceAtLeast(0)
-        val minutes = safe / 60_000
-        val seconds = (safe / 1000) % 60
-        val millis = safe % 1000
-        return "%02d:%02d.%03d".format(minutes, seconds, millis)
     }
 
     private fun splitSelected() {
-        val clip = clips.find { it.id == selectedId } ?: run {
+        val clip = selectedClip() ?: run {
             showStatus("اختر مقطعًا أولًا")
             return
         }
-        val local = playheadMs - clip.startMs
-        if (local <= 0L || local >= clip.lengthMs()) {
+
+        val offset = playheadMs - clip.startMs
+
+        if (offset <= 0L || offset >= clip.lengthMs()) {
             showStatus("ضع المؤشر داخل المقطع لتقسيمه")
             return
         }
 
         rememberUndo()
-        val splitSource = clip.trimStartMs + local
+
+        val splitSource = clip.trimStartMs + offset
         val right = clip.copy(
             id = System.nanoTime(),
-            name = clip.name + " (2)",
+            name = "${clip.name} (2)",
             startMs = playheadMs,
             trimStartMs = splitSource,
             trimEndMs = clip.trimEndMs
         )
+
         clip.trimEndMs = splitSource
         clips.add(right)
         selectedId = right.id
+
         refreshTimeline()
         saveLocalProject()
     }
 
     private fun duplicateSelected() {
-        val clip = clips.find { it.id == selectedId } ?: return
+        val clip = selectedClip() ?: run {
+            showStatus("اختر مقطعًا أولًا")
+            return
+        }
+
         rememberUndo()
+
         val copy = clip.copy(
             id = System.nanoTime(),
-            name = clip.name + " - نسخة",
+            name = "${clip.name} - نسخة",
             startMs = clip.endMs()
         )
+
         clips.add(copy)
         selectedId = copy.id
-        tracks = max(tracks, copy.track + 1)
         refreshTimeline()
         saveLocalProject()
     }
 
-    private fun renameSelected() {
-        val clip = clips.find { it.id == selectedId } ?: run {
+    private fun deleteSelected() {
+        val clip = selectedClip() ?: run {
             showStatus("اختر مقطعًا أولًا")
             return
         }
+
+        rememberUndo()
+        clips.removeAll { it.id == clip.id }
+        selectedId = null
+        refreshTimeline()
+        saveLocalProject()
+        showStatus("تم حذف المقطع")
+    }
+
+    private fun renameSelected() {
+        val clip = selectedClip() ?: run {
+            showStatus("اختر مقطعًا أولًا")
+            return
+        }
+
         val input = EditText(this).apply {
             setText(clip.name)
             setSelection(text.length)
             singleLine = true
         }
+
         AlertDialog.Builder(this)
             .setTitle("إعادة تسمية المقطع")
             .setView(input)
             .setNegativeButton("إلغاء", null)
             .setPositiveButton("حفظ") { _, _ ->
-                val newName = input.text.toString().trim()
-                if (newName.isNotEmpty()) {
+                val name = input.text.toString().trim()
+
+                if (name.isNotEmpty()) {
                     rememberUndo()
-                    clip.name = newName
+                    clip.name = name
                     refreshTimeline()
                     saveLocalProject()
                 }
@@ -522,17 +547,26 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun chooseClipColor() {
-        val clip = clips.find { it.id == selectedId } ?: run {
+        val clip = selectedClip() ?: run {
             showStatus("اختر مقطعًا أولًا")
             return
         }
-        val names = arrayOf("أخضر", "أزرق", "بنفسجي", "برتقالي", "أحمر", "أبيض")
-        val colors = intArrayOf(
-            0xFF276B4B.toInt(), 0xFF245A9B.toInt(), 0xFF7046A8.toInt(),
-            0xFFB86A20.toInt(), 0xFF9D3434.toInt(), 0xFF69756E.toInt()
+
+        val names = arrayOf(
+            "أخضر", "أزرق", "بنفسجي", "برتقالي", "أحمر", "رمادي"
         )
+
+        val colors = intArrayOf(
+            0xFF276B4B.toInt(),
+            0xFF245A9B.toInt(),
+            0xFF7046A8.toInt(),
+            0xFFB86A20.toInt(),
+            0xFF9D3434.toInt(),
+            0xFF69756E.toInt()
+        )
+
         AlertDialog.Builder(this)
-            .setTitle("اختر لون المقطع")
+            .setTitle("لون المقطع")
             .setItems(names) { _, which ->
                 rememberUndo()
                 clip.color = colors[which]
@@ -544,54 +578,48 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun jumpToSelectedStart() {
-        val clip = clips.find { it.id == selectedId } ?: run {
-            showStatus("اختر مقطعًا أولًا")
-            return
-        }
+        val clip = selectedClip() ?: return
         playheadMs = clip.startMs
         refreshTimeline()
-        showStatus("انتقل المؤشر إلى بداية المقطع")
-    }
-
-    private fun deleteSelected() {
-        val id = selectedId ?: return
-        rememberUndo()
-        clips.removeAll { it.id == id }
-        selectedId = null
-        refreshTimeline()
-        saveLocalProject()
     }
 
     private fun trimStartAtPlayhead() {
-        val clip = clips.find { it.id == selectedId } ?: return
+        val clip = selectedClip() ?: return
         val offset = playheadMs - clip.startMs
+
         if (offset <= 0L || offset >= clip.lengthMs()) {
             showStatus("ضع المؤشر داخل المقطع")
             return
         }
+
         rememberUndo()
         clip.trimStartMs += offset
         clip.startMs = playheadMs
         refreshTimeline()
+        saveLocalProject()
     }
 
     private fun trimEndAtPlayhead() {
-        val clip = clips.find { it.id == selectedId } ?: return
+        val clip = selectedClip() ?: return
         val offset = playheadMs - clip.startMs
+
         if (offset <= 0L || offset >= clip.lengthMs()) {
             showStatus("ضع المؤشر داخل المقطع")
             return
         }
+
         rememberUndo()
         clip.trimEndMs = clip.trimStartMs + offset
         refreshTimeline()
+        saveLocalProject()
     }
 
     private fun toggleMute() {
-        val clip = clips.find { it.id == selectedId } ?: return
+        val clip = selectedClip() ?: return
         rememberUndo()
         clip.muted = !clip.muted
         refreshTimeline()
+        saveLocalProject()
     }
 
     private fun togglePlayback() {
@@ -609,37 +637,62 @@ class MainActivity : ComponentActivity() {
         }
 
         if (clip == null) {
-            showStatus("لا يوجد مقطع عند موضع التشغيل")
+            showStatus("لا يوجد مقطع قابل للتشغيل عند هذا الموضع")
             return
         }
 
+        releasePlayer()
+
         try {
-            player?.release()
-            player = MediaPlayer().apply {
-                setDataSource(
-                    this@MainActivity,
-                    Uri.parse(clip.uri)
+            val newPlayer = MediaPlayer()
+            player = newPlayer
+
+            newPlayer.setDataSource(this, Uri.parse(clip.uri))
+
+            newPlayer.setOnPreparedListener { prepared ->
+                if (player !== prepared) {
+                    prepared.release()
+                    return@setOnPreparedListener
+                }
+
+                val offset = (playheadMs - clip.startMs).coerceAtLeast(0L)
+                val sourcePosition = clip.trimStartMs + offset
+
+                prepared.setVolume(
+                    if (clip.muted) 0f else clip.volume,
+                    if (clip.muted) 0f else clip.volume
                 )
-                setVolume(clip.volume, clip.volume)
-                setOnPreparedListener {
-                    val offset = (playheadMs - clip.startMs).coerceAtLeast(0L)
-                    val sourcePosition = clip.trimStartMs + offset
-                    seekTo(
-                        sourcePosition.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
-                    )
-                    start()
-                    isPlaying = true
-                    showStatus("جارٍ التشغيل: ${clip.name}")
-                    handler.post(playbackTicker)
-                }
-                setOnCompletionListener {
-                    isPlaying = false
-                    playheadMs = clip.endMs()
-                    refreshTimeline()
-                }
-                prepareAsync()
+
+                prepared.seekTo(
+                    sourcePosition.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                )
+
+                prepared.start()
+                isPlaying = true
+                showStatus("جارٍ تشغيل: ${clip.name}")
+                handler.removeCallbacks(playbackTicker)
+                handler.post(playbackTicker)
             }
+
+            newPlayer.setOnCompletionListener {
+                isPlaying = false
+                playheadMs = clip.endMs()
+                handler.removeCallbacks(playbackTicker)
+                refreshTimeline()
+                releasePlayer()
+            }
+
+            newPlayer.setOnErrorListener { _, _, _ ->
+                isPlaying = false
+                handler.removeCallbacks(playbackTicker)
+                showStatus("تعذر تشغيل هذا الملف الصوتي")
+                releasePlayer()
+                true
+            }
+
+            newPlayer.prepareAsync()
         } catch (e: Exception) {
+            releasePlayer()
             showStatus("تعذر التشغيل: ${e.message}")
         }
     }
@@ -647,106 +700,171 @@ class MainActivity : ComponentActivity() {
     private val playbackTicker = object : Runnable {
         override fun run() {
             if (!isPlaying) return
-            val p = player
-            if (p != null) {
-                try {
-                    val clip = clips.firstOrNull {
-                        playheadMs >= it.startMs && playheadMs < it.endMs()
-                    }
+
+            try {
+                val current = player
+                if (current != null && current.isPlaying) {
+                    val clip = selectedClip()
                     if (clip != null) {
                         playheadMs = clip.startMs +
-                            (p.currentPosition - clip.trimStartMs).coerceAtLeast(0)
+                            (current.currentPosition - clip.trimStartMs)
+                                .coerceAtLeast(0L)
                     }
                     refreshTimeline()
-                } catch (_: Exception) {}
+                }
+            } catch (_: Exception) {
             }
-            handler.postDelayed(this, 40)
+
+            handler.postDelayed(this, 100L)
         }
     }
 
     private fun pausePlayback() {
         try {
             player?.pause()
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+        }
+
         isPlaying = false
         handler.removeCallbacks(playbackTicker)
-        showStatus("متوقف مؤقتًا")
+        showStatus("تم الإيقاف المؤقت")
     }
 
-    private fun stopPlayback() {
+    private fun releasePlayer() {
         try {
-            player?.stop()
+            player?.setOnPreparedListener(null)
+            player?.setOnCompletionListener(null)
+            player?.setOnErrorListener(null)
             player?.release()
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+        }
+
         player = null
         isPlaying = false
         handler.removeCallbacks(playbackTicker)
+    }
+
+    private fun stopPlayback() {
+        releasePlayer()
         playheadMs = 0L
         refreshTimeline()
         showStatus("تم إيقاف التشغيل")
     }
+
     private fun toggleRecording() {
         if (isRecording) {
             finishRecording()
             return
         }
 
+        if (
+            ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.RECORD_AUDIO
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(
+                arrayOf(Manifest.permission.RECORD_AUDIO),
+                REQUEST_MICROPHONE
+            )
+            return
+        }
+
+        startRecording()
+    }
+
+    private fun startRecording() {
+        val file = File(
+            filesDir,
+            "recording_${System.currentTimeMillis()}.m4a"
+        )
+
+        var newRecorder: MediaRecorder? = null
+
         try {
-            val file = File(cacheDir, "recording_${System.currentTimeMillis()}.m4a")
-            val r = if (Build.VERSION.SDK_INT >= 31) {
+            newRecorder = if (Build.VERSION.SDK_INT >= 31) {
                 MediaRecorder(this)
             } else {
                 @Suppress("DEPRECATION")
                 MediaRecorder()
             }
-            r.setAudioSource(MediaRecorder.AudioSource.MIC)
-            r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-            r.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-            r.setOutputFile(file.absolutePath)
-            r.prepare()
-            r.start()
-            recorder = r
+
+            newRecorder.setAudioSource(MediaRecorder.AudioSource.MIC)
+            newRecorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            newRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+            newRecorder.setOutputFile(file.absolutePath)
+            newRecorder.prepare()
+            newRecorder.start()
+
+            recorder = newRecorder
             recordingFile = file
             recordingStartedAt = System.currentTimeMillis()
             isRecording = true
-            showStatus("جارٍ التسجيل… اضغط زر التسجيل مرة أخرى لإنهائه")
+
+            showStatus("جارٍ التسجيل؛ اضغط الزر لإنهائه")
         } catch (e: Exception) {
+            try {
+                newRecorder?.release()
+            } catch (_: Exception) {
+            }
+
+            recorder = null
+            isRecording = false
             showStatus("تعذر بدء التسجيل: ${e.message}")
         }
     }
 
     private fun finishRecording() {
+        val elapsed = System.currentTimeMillis() - recordingStartedAt
+        var success = false
+
         try {
             recorder?.stop()
-            recorder?.release()
+            success = true
+        } catch (_: Exception) {
+            showStatus("كان التسجيل قصيرًا جدًا أو تعذر حفظه")
+        } finally {
+            try {
+                recorder?.release()
+            } catch (_: Exception) {
+            }
+
             recorder = null
             isRecording = false
-            val file = recordingFile
-            if (file != null && file.exists() && file.length() > 0) {
-                val duration = System.currentTimeMillis() - recordingStartedAt
-                rememberUndo()
-                val clip = AudioClip(
-                    id = System.nanoTime(),
-                    uri = Uri.fromFile(file).toString(),
-                    name = "تسجيل جديد",
-                    track = 0,
-                    startMs = playheadMs,
-                    durationMs = duration
-                )
-                clips.add(clip)
-                selectedId = clip.id
-                refreshTimeline()
-                showStatus("تمت إضافة التسجيل إلى المسار الأول")
-                saveLocalProject()
-            }
-        } catch (e: Exception) {
-            showStatus("تعذر إنهاء التسجيل: ${e.message}")
         }
+
+        val file = recordingFile
+        recordingFile = null
+
+        if (!success || file == null || !file.exists() || file.length() == 0L) {
+            return
+        }
+
+        rememberUndo()
+
+        val clip = AudioClip(
+            id = System.nanoTime(),
+            uri = Uri.fromFile(file).toString(),
+            name = "تسجيل جديد",
+            track = 0,
+            startMs = playheadMs,
+            durationMs = elapsed.coerceAtLeast(1L)
+        )
+
+        clips.add(clip)
+        selectedId = clip.id
+        refreshTimeline()
+        saveLocalProject()
+        showStatus("تم حفظ التسجيل وإضافته للمشروع")
     }
 
     private fun rememberUndo() {
         undoStack.addLast(projectJson())
-        while (undoStack.size > 30) undoStack.removeFirst()
+
+        while (undoStack.size > 30) {
+            undoStack.removeFirst()
+        }
+
         redoStack.clear()
     }
 
@@ -755,82 +873,104 @@ class MainActivity : ComponentActivity() {
             showStatus("لا توجد خطوة للتراجع")
             return
         }
+
         redoStack.addLast(projectJson())
         loadProjectJson(undoStack.removeLast())
+        saveLocalProject()
         showStatus("تم التراجع")
     }
 
     private fun redo() {
         if (redoStack.isEmpty()) {
-            showStatus("لا توجد خطوة لإعادتها")
+            showStatus("لا توجد خطوة للإعادة")
             return
         }
+
         undoStack.addLast(projectJson())
         loadProjectJson(redoStack.removeLast())
+        saveLocalProject()
         showStatus("تمت إعادة الخطوة")
     }
 
     private fun projectJson(): String {
-        val rootJson = JSONObject()
-        rootJson.put("version", 1)
-        rootJson.put("tracks", tracks)
-        rootJson.put("playheadMs", playheadMs)
-        rootJson.put("zoom", zoom.toDouble())
+        val obj = JSONObject()
+        obj.put("version", 1)
+        obj.put("tracks", tracks)
+        obj.put("playheadMs", playheadMs)
+        obj.put("zoom", zoom.toDouble())
+
         val array = JSONArray()
 
-        clips.forEach { c ->
-            array.put(JSONObject().apply {
-                put("id", c.id)
-                put("uri", c.uri)
-                put("name", c.name)
-                put("track", c.track)
-                put("startMs", c.startMs)
-                put("durationMs", c.durationMs)
-                put("trimStartMs", c.trimStartMs)
-                put("trimEndMs", c.trimEndMs)
-                put("volume", c.volume.toDouble())
-                put("muted", c.muted)
-                put("color", c.color)
-            })
+        clips.forEach { clip ->
+            array.put(
+                JSONObject().apply {
+                    put("id", clip.id)
+                    put("uri", clip.uri)
+                    put("name", clip.name)
+                    put("track", clip.track)
+                    put("startMs", clip.startMs)
+                    put("durationMs", clip.durationMs)
+                    put("trimStartMs", clip.trimStartMs)
+                    put("trimEndMs", clip.trimEndMs)
+                    put("volume", clip.volume.toDouble())
+                    put("muted", clip.muted)
+                    put("color", clip.color)
+                }
+            )
         }
 
-        rootJson.put("clips", array)
-        return rootJson.toString()
+        obj.put("clips", array)
+        return obj.toString()
     }
 
-    private fun loadProjectJson(text: String) {
+    private fun loadProjectJson(json: String) {
         try {
-            val obj = JSONObject(text)
-            clips.clear()
-            val array = obj.getJSONArray("clips")
+            val obj = JSONObject(json)
+            val array = obj.optJSONArray("clips") ?: JSONArray()
+            val loaded = mutableListOf<AudioClip>()
 
             for (i in 0 until array.length()) {
-                val c = array.getJSONObject(i)
-                clips.add(
+                val c = array.optJSONObject(i) ?: continue
+
+                val duration = c.optLong("durationMs", 0L)
+                    .coerceAtLeast(0L)
+
+                val trimStart = c.optLong("trimStartMs", 0L)
+                    .coerceIn(0L, duration)
+
+                val trimEnd = c.optLong("trimEndMs", duration)
+                    .coerceIn(trimStart, duration)
+
+                loaded.add(
                     AudioClip(
                         id = c.optLong("id", System.nanoTime()),
-                        uri = c.getString("uri"),
+                        uri = c.optString("uri", ""),
                         name = c.optString("name", "مقطع صوتي"),
-                        track = c.optInt("track", 0),
-                        startMs = c.optLong("startMs", 0),
-                        durationMs = c.optLong("durationMs", 0),
-                        trimStartMs = c.optLong("trimStartMs", 0),
-                        trimEndMs = c.optLong(
-                            "trimEndMs",
-                            c.optLong("durationMs", 0)
-                        ),
-                        volume = c.optDouble("volume", 1.0).toFloat(),
+                        track = c.optInt("track", 0).coerceAtLeast(0),
+                        startMs = c.optLong("startMs", 0L).coerceAtLeast(0L),
+                        durationMs = duration,
+                        trimStartMs = trimStart,
+                        trimEndMs = trimEnd,
+                        volume = c.optDouble("volume", 1.0)
+                            .toFloat().coerceIn(0f, 1f),
                         muted = c.optBoolean("muted", false),
                         color = c.optInt("color", 0xFF276B4B.toInt())
                     )
                 )
             }
 
-            tracks = max(1, obj.optInt("tracks", 3))
-            playheadMs = obj.optLong("playheadMs", 0)
+            clips.clear()
+            clips.addAll(loaded)
+
+            tracks = max(
+                max(1, obj.optInt("tracks", 3)),
+                (clips.maxOfOrNull { it.track } ?: 0) + 1
+            ).coerceAtMost(20)
+
+            playheadMs = obj.optLong("playheadMs", 0L).coerceAtLeast(0L)
             zoom = obj.optDouble("zoom", 70.0)
-                .toFloat()
-                .coerceIn(8f, 240f)
+                .toFloat().coerceIn(8f, 240f)
+
             selectedId = clips.firstOrNull()?.id
             refreshTimeline()
         } catch (e: Exception) {
@@ -840,7 +980,7 @@ class MainActivity : ComponentActivity() {
 
     private fun saveLocalProject() {
         prefs.edit().putString("project", projectJson()).apply()
-        showStatus("تم حفظ المشروع على هذا الجهاز")
+        showStatus("تم حفظ المشروع على الجهاز")
     }
 
     private fun restoreLocalProject() {
@@ -849,253 +989,42 @@ class MainActivity : ComponentActivity() {
         showStatus("تمت استعادة المشروع المحفوظ")
     }
 
-    private fun createProjectFile() {
+    private fun exportProject() {
         val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "application/json"
             putExtra(Intent.EXTRA_TITLE, "SahlAudio-project.json")
         }
-        startActivityForResult(intent, exportProject)
+
+        startActivityForResult(intent, REQUEST_EXPORT_PROJECT)
     }
 
-    private fun openProjectFile() {
+    private fun importProject() {
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "application/json"
         }
-        startActivityForResult(intent, importProject)
-    }
 
-    private fun startWavExport() {
-        if (clips.isEmpty()) {
-            showStatus("أضف مقطعًا قبل التصدير")
-            return
-        }
-
-        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
-            addCategory(Intent.CATEGORY_OPENABLE)
-            type = "audio/wav"
-            putExtra(Intent.EXTRA_TITLE, "SahlAudio-mix.wav")
-        }
-        startActivityForResult(intent, exportWav)
-    }
-
-    /*
-     * تصدير WAV محدود بدقيقتين لتجنب استهلاك ذاكرة الهاتف.
-     * النسخة الحالية تدعم ملفات WAV PCM غير المضغوطة فقط.
-     */
-    private fun exportMixedWav(output: java.io.OutputStream) {
-        val sampleRate = 44100
-        val totalMs = projectEndMs()
-
-        if (totalMs > 120_000L) {
-            throw IllegalStateException(
-                "التصدير الحالي محدود بدقيقتين لتجنب استهلاك ذاكرة الهاتف"
-            )
-        }
-
-        val totalFrames = (totalMs * sampleRate / 1000L).toInt()
-        val mix = FloatArray(totalFrames)
-
-        for (clip in clips) {
-            if (clip.muted || clip.lengthMs() <= 0) continue
-
-            val uri = Uri.parse(clip.uri)
-            val pcm = decodePcmMono(uri, sampleRate)
-
-            val sourceStart = (clip.trimStartMs * sampleRate / 1000L)
-                .toInt().coerceIn(0, pcm.size)
-            val sourceEnd = (clip.trimEndMs * sampleRate / 1000L)
-                .toInt().coerceIn(sourceStart, pcm.size)
-            val targetStart = (clip.startMs * sampleRate / 1000L)
-                .toInt().coerceIn(0, totalFrames)
-            val count = min(sourceEnd - sourceStart, totalFrames - targetStart)
-
-            for (i in 0 until count) {
-                mix[targetStart + i] =
-                    (mix[targetStart + i] + pcm[sourceStart + i] * clip.volume)
-                        .coerceIn(-1f, 1f)
-            }
-        }
-
-        val dataBytes = totalFrames * 2
-        val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
-
-        header.put("RIFF".toByteArray(Charsets.US_ASCII))
-        header.putInt(36 + dataBytes)
-        header.put("WAVE".toByteArray(Charsets.US_ASCII))
-        header.put("fmt ".toByteArray(Charsets.US_ASCII))
-        header.putInt(16)
-        header.putShort(1.toShort())
-        header.putShort(1.toShort())
-        header.putInt(sampleRate)
-        header.putInt(sampleRate * 2)
-        header.putShort(2.toShort())
-        header.putShort(16.toShort())
-        header.put("data".toByteArray(Charsets.US_ASCII))
-        header.putInt(dataBytes)
-
-        output.write(header.array())
-
-        val buffer = ByteBuffer.allocate(8192).order(ByteOrder.LITTLE_ENDIAN)
-
-        for (sample in mix) {
-            val pcm16 = (sample * 32767f).toInt()
-                .coerceIn(-32768, 32767).toShort()
-
-            if (buffer.remaining() < 2) {
-                output.write(buffer.array(), 0, buffer.position())
-                buffer.clear()
-            }
-            buffer.putShort(pcm16)
-        }
-
-        if (buffer.position() > 0) {
-            output.write(buffer.array(), 0, buffer.position())
-        }
-
-        output.flush()
-    }
-    private fun decodePcmMono(uri: Uri, targetRate: Int): FloatArray {
-        /*
-         * يدعم التصدير الحالي ملفات WAV غير المضغوطة فقط.
-         * يجب تنفيذ وفحص فك ترميز الصيغ المضغوطة بصورة منفصلة.
-         */
-        val input = contentResolver.openInputStream(uri)
-            ?: throw IllegalStateException("تعذر فتح الملف الصوتي")
-        val bytes = input.use { it.readBytes() }
-
-        if (
-            bytes.size < 44 ||
-            String(bytes, 0, 4, Charsets.US_ASCII) != "RIFF" ||
-            String(bytes, 8, 4, Charsets.US_ASCII) != "WAVE"
-        ) {
-            throw IllegalStateException(
-                "التصدير الحالي يقبل ملفات WAV غير المضغوطة فقط"
-            )
-        }
-
-        var offset = 12
-        var channels = 0
-        var rate = 0
-        var bits = 0
-        var format = 0
-        var dataOffset = -1
-        var dataSize = 0
-
-        while (offset + 8 <= bytes.size) {
-            val id = String(bytes, offset, 4, Charsets.US_ASCII)
-            val size = ByteBuffer.wrap(bytes, offset + 4, 4)
-                .order(ByteOrder.LITTLE_ENDIAN).int
-            val body = offset + 8
-
-            if (size < 0 || body + size > bytes.size) break
-
-            when (id) {
-                "fmt " -> {
-                    format = ByteBuffer.wrap(bytes, body, 2)
-                        .order(ByteOrder.LITTLE_ENDIAN)
-                        .short.toInt() and 0xFFFF
-
-                    channels = ByteBuffer.wrap(bytes, body + 2, 2)
-                        .order(ByteOrder.LITTLE_ENDIAN)
-                        .short.toInt() and 0xFFFF
-
-                    rate = ByteBuffer.wrap(bytes, body + 4, 4)
-                        .order(ByteOrder.LITTLE_ENDIAN)
-                        .int
-
-                    bits = ByteBuffer.wrap(bytes, body + 14, 2)
-                        .order(ByteOrder.LITTLE_ENDIAN)
-                        .short.toInt() and 0xFFFF
-                }
-
-                "data" -> {
-                    dataOffset = body
-                    dataSize = size
-                    break
-                }
-            }
-
-            offset = body + size + (size and 1)
-        }
-
-        if (
-            format != 1 ||
-            (bits != 16 && bits != 8) ||
-            channels !in 1..2 ||
-            rate <= 0 ||
-            dataOffset < 0
-        ) {
-            throw IllegalStateException(
-                "نوع WAV غير مدعوم؛ المطلوب PCM أحادي أو ثنائي القناة بدقة 8 أو 16 بت"
-            )
-        }
-
-        val bytesPerSample = bits / 8
-        val frames = dataSize / (bytesPerSample * channels)
-        val mono = FloatArray(frames)
-
-        for (frame in 0 until frames) {
-            var sum = 0f
-
-            for (ch in 0 until channels) {
-                val p = dataOffset +
-                    (frame * channels + ch) * bytesPerSample
-
-                val sample = if (bits == 16) {
-                    ByteBuffer.wrap(bytes, p, 2)
-                        .order(ByteOrder.LITTLE_ENDIAN)
-                        .short.toFloat() / 32768f
-                } else {
-                    ((bytes[p].toInt() and 0xFF) - 128) / 128f
-                }
-
-                sum += sample
-            }
-
-            mono[frame] = sum / channels
-        }
-
-        if (rate == targetRate) return mono
-
-        val outSize = (
-            mono.size.toDouble() * targetRate / rate
-        ).toInt().coerceAtLeast(1)
-
-        val resampled = FloatArray(outSize)
-
-        for (i in resampled.indices) {
-            val src = i.toDouble() * rate / targetRate
-            val left = src.toInt().coerceIn(0, mono.lastIndex)
-            val right = min(left + 1, mono.lastIndex)
-            val fraction = (src - left).toFloat()
-
-            resampled[i] =
-                mono[left] * (1f - fraction) +
-                mono[right] * fraction
-        }
-
-        return resampled
+        startActivityForResult(intent, REQUEST_IMPORT_PROJECT)
     }
 
     inner class TimelineView(context: Context) : View(context) {
+
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val trackHeight = dp(86f)
         private val rulerHeight = dp(36f)
         private val leftGutter = dp(62f)
 
+        private var downX = 0f
         private var lastX = 0f
-        private var lastY = 0f
         private var dragMode = "none"
-        private var dragClipId: Long? = null
+        private var dragId: Long? = null
+        private var changed = false
+        private var beforeDrag = ""
 
         private var originalStart = 0L
-        private var originalTrack = 0
         private var originalTrimStart = 0L
         private var originalTrimEnd = 0L
-
-        private var changed = false
 
         private fun timeToX(ms: Long): Float =
             leftGutter + ms / 1000f * zoom
@@ -1108,18 +1037,12 @@ class MainActivity : ComponentActivity() {
             heightMeasureSpec: Int
         ) {
             val contentWidth = (
-                leftGutter +
-                    projectEndMs() / 1000f * zoom +
-                    dp(120f)
+                leftGutter + projectEndMs() / 1000f * zoom + dp(120f)
             ).toInt().coerceAtLeast(dp(360f))
 
-            val contentHeight =
-                rulerHeight + tracks * trackHeight + dp(12f)
+            val contentHeight = rulerHeight + tracks * trackHeight + dp(12f)
 
-            setMeasuredDimension(
-                resolveSize(contentWidth, widthMeasureSpec),
-                resolveSize(contentHeight, heightMeasureSpec)
-            )
+            setMeasuredDimension(contentWidth, contentHeight)
         }
 
         override fun onDraw(canvas: Canvas) {
@@ -1128,49 +1051,37 @@ class MainActivity : ComponentActivity() {
 
             paint.color = 0xFF17221B.toInt()
             canvas.drawRect(
-                0f,
-                0f,
-                width.toFloat(),
-                rulerHeight.toFloat(),
-                paint
+                0f, 0f, width.toFloat(), rulerHeight.toFloat(), paint
             )
 
             val end = projectEndMs()
-
-            val stepMs = when {
+            val step = when {
                 zoom >= 120f -> 1000L
                 zoom >= 45f -> 2000L
                 zoom >= 20f -> 5000L
                 else -> 10000L
             }
 
-            var t = 0L
+            var time = 0L
 
-            while (t <= end + stepMs) {
-                val x = timeToX(t)
+            while (time <= end + step) {
+                val x = timeToX(time)
 
                 paint.color = 0xFF35443A.toInt()
-                paint.strokeWidth = 1f
-
                 canvas.drawLine(
-                    x,
-                    rulerHeight.toFloat(),
-                    x,
-                    height.toFloat(),
-                    paint
+                    x, rulerHeight.toFloat(), x, height.toFloat(), paint
                 )
 
                 paint.color = MUTED
                 paint.textSize = dp(10f).toFloat()
-
                 canvas.drawText(
-                    formatTime(t).substring(0, 5),
+                    formatTime(time).substring(0, 5),
                     x + dp(3f),
                     dp(23f).toFloat(),
                     paint
                 )
 
-                t += stepMs
+                time += step
             }
 
             for (track in 0 until tracks) {
@@ -1183,89 +1094,42 @@ class MainActivity : ComponentActivity() {
                 }
 
                 canvas.drawRect(
-                    0f,
-                    top.toFloat(),
-                    width.toFloat(),
-                    (top + trackHeight).toFloat(),
-                    paint
+                    0f, top.toFloat(), width.toFloat(),
+                    (top + trackHeight).toFloat(), paint
                 )
 
                 paint.color = MUTED
                 paint.textSize = dp(11f).toFloat()
-
                 canvas.drawText(
                     "مسار ${track + 1}",
                     dp(5f).toFloat(),
                     (top + dp(18f)).toFloat(),
                     paint
                 )
-
-                paint.color = 0xFF29382E.toInt()
-
-                canvas.drawLine(
-                    leftGutter,
-                    (top + trackHeight).toFloat(),
-                    width.toFloat(),
-                    (top + trackHeight).toFloat(),
-                    paint
-                )
             }
 
             clips.forEach { clip ->
+                if (clip.track !in 0 until tracks) return@forEach
+
                 val x1 = timeToX(clip.startMs)
                 val x2 = timeToX(clip.endMs())
-
-                val top =
-                    rulerHeight + clip.track * trackHeight + dp(8f)
-
-                val bottom =
-                    rulerHeight +
-                        (clip.track + 1) * trackHeight -
-                        dp(8f)
+                val top = rulerHeight + clip.track * trackHeight + dp(8f)
+                val bottom = rulerHeight +
+                    (clip.track + 1) * trackHeight - dp(8f)
 
                 paint.color = clip.color
 
                 canvas.drawRoundRect(
-                    x1,
-                    top.toFloat(),
-                    max(x1 + dp(8f), x2),
-                    bottom.toFloat(),
-                    dp(7f).toFloat(),
-                    dp(7f).toFloat(),
-                    paint
+                    x1, top.toFloat(),
+                    max(x1 + dp(10f), x2), bottom.toFloat(),
+                    dp(7f).toFloat(), dp(7f).toFloat(), paint
                 )
-
-                paint.color = if (clip.muted) MUTED else clip.color
-                paint.strokeWidth = dp(1f).toFloat()
-
-                val middle = (top + bottom) / 2f
-                val barWidth = max(2f, zoom / 14f)
-
-                var x = x1 + dp(5f)
-
-                while (x < x2 - dp(4f)) {
-                    val seed =
-                        ((x.toInt() * 31 + clip.id.toInt()) ushr 3) and 31
-
-                    val heightFactor = 0.18f + (seed % 13) / 18f
-                    val half = (bottom - top) * heightFactor / 2f
-
-                    canvas.drawLine(
-                        x,
-                        middle - half,
-                        x,
-                        middle + half,
-                        paint
-                    )
-
-                    x += barWidth
-                }
 
                 paint.color = WHITE
                 paint.textSize = dp(11f).toFloat()
 
                 canvas.drawText(
-                    clip.name.take(22),
+                    clip.name.take(20),
                     x1 + dp(6f),
                     top + dp(14f),
                     paint
@@ -1274,59 +1138,45 @@ class MainActivity : ComponentActivity() {
                 if (clip.id == selectedId) {
                     paint.color = GOLD
                     paint.strokeWidth = dp(3f).toFloat()
-
                     canvas.drawLine(
-                        x1,
-                        top.toFloat(),
-                        x1,
-                        bottom.toFloat(),
-                        paint
+                        x1, top.toFloat(), x1, bottom.toFloat(), paint
                     )
-
                     canvas.drawLine(
-                        x2,
-                        top.toFloat(),
-                        x2,
-                        bottom.toFloat(),
-                        paint
+                        x2, top.toFloat(), x2, bottom.toFloat(), paint
                     )
                 }
             }
 
             val px = timeToX(playheadMs)
-
             paint.color = 0xFFFF625D.toInt()
             paint.strokeWidth = dp(2f).toFloat()
-
-            canvas.drawLine(
-                px,
-                0f,
-                px,
-                height.toFloat(),
-                paint
-            )
-
-            canvas.drawCircle(
-                px,
-                dp(5f).toFloat(),
-                dp(5f).toFloat(),
-                paint
-            )
+            canvas.drawLine(px, 0f, px, height.toFloat(), paint)
+            canvas.drawCircle(px, dp(5f).toFloat(), dp(5f).toFloat(), paint)
         }
 
         override fun onTouchEvent(event: MotionEvent): Boolean {
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
+                    downX = event.x
                     lastX = event.x
-                    lastY = event.y
                     changed = false
-                    dragClipId = null
+                    dragId = null
+
+                    beforeDrag = projectJson()
 
                     val px = timeToX(playheadMs)
 
                     if (kotlin.math.abs(event.x - px) < dp(18f)) {
                         dragMode = "playhead"
                         parent?.requestDisallowInterceptTouchEvent(true)
+                        return true
+                    }
+
+                    if (event.y < rulerHeight) {
+                        dragMode = "playhead"
+                        playheadMs = xToTime(event.x)
+                            .coerceAtMost(projectEndMs())
+                        invalidate()
                         return true
                     }
 
@@ -1337,39 +1187,31 @@ class MainActivity : ComponentActivity() {
                     val hit = clips.asReversed().firstOrNull {
                         it.track == track &&
                             event.x >= timeToX(it.startMs) - dp(4f) &&
-                            event.x <= timeToX(it.endMs()) + dp(4f) &&
-                            event.y >= rulerHeight + track * trackHeight &&
-                            event.y < rulerHeight + (track + 1) * trackHeight
+                            event.x <= timeToX(it.endMs()) + dp(4f)
                     }
 
-                    if (hit != null) {
+                    if (hit == null) {
+                        dragMode = "playhead"
+                        playheadMs = xToTime(event.x)
+                            .coerceAtMost(projectEndMs())
+                    } else {
                         selectedId = hit.id
-                        dragClipId = hit.id
-
+                        dragId = hit.id
                         originalStart = hit.startMs
-                        originalTrack = hit.track
                         originalTrimStart = hit.trimStartMs
                         originalTrimEnd = hit.trimEndMs
 
                         val nearLeft =
-                            kotlin.math.abs(
-                                event.x - timeToX(hit.startMs)
-                            ) < dp(14f)
+                            kotlin.math.abs(event.x - timeToX(hit.startMs)) < dp(14f)
 
                         val nearRight =
-                            kotlin.math.abs(
-                                event.x - timeToX(hit.endMs())
-                            ) < dp(14f)
+                            kotlin.math.abs(event.x - timeToX(hit.endMs())) < dp(14f)
 
                         dragMode = when {
                             nearLeft -> "trimStart"
                             nearRight -> "trimEnd"
                             else -> "clip"
                         }
-                    } else {
-                        dragMode = "playhead"
-                        playheadMs =
-                            xToTime(event.x).coerceAtMost(projectEndMs())
                     }
 
                     refreshTimeline()
@@ -1378,25 +1220,20 @@ class MainActivity : ComponentActivity() {
                 }
 
                 MotionEvent.ACTION_MOVE -> {
-                    val dx = event.x - lastX
+                    val clip = clips.firstOrNull { it.id == dragId }
 
                     when (dragMode) {
                         "playhead" -> {
-                            playheadMs =
-                                xToTime(event.x).coerceAtMost(projectEndMs())
+                            playheadMs = xToTime(event.x)
+                                .coerceAtMost(projectEndMs())
                             changed = true
                         }
 
                         "clip" -> {
-                            val clip = clips.find {
-                                it.id == dragClipId
-                            }
-
                             if (clip != null) {
-                                val delta = (dx / zoom * 1000f).toLong()
+                                val deltaMs = ((event.x - lastX) / zoom * 1000f).toLong()
 
-                                clip.startMs =
-                                    (clip.startMs + delta).coerceAtLeast(0L)
+                                clip.startMs = (clip.startMs + deltaMs).coerceAtLeast(0L)
 
                                 val newTrack = (
                                     (event.y - rulerHeight) / trackHeight
@@ -1408,36 +1245,29 @@ class MainActivity : ComponentActivity() {
                         }
 
                         "trimStart" -> {
-                            val clip = clips.find {
-                                it.id == dragClipId
-                            }
-
                             if (clip != null) {
                                 val proposed = xToTime(event.x)
-                                val offset = proposed - clip.startMs
-                                val source = originalTrimStart + offset
+                                val delta = proposed - originalStart
+                                val source = originalTrimStart + delta
+                                val newStart = proposed.coerceAtLeast(0L)
 
                                 if (
-                                    source >= 0 &&
-                                    source < clip.trimEndMs
+                                    source >= 0L &&
+                                    source < originalTrimEnd &&
+                                    newStart < clip.endMs()
                                 ) {
                                     clip.trimStartMs = source
-                                    clip.startMs = proposed.coerceAtLeast(0)
+                                    clip.startMs = newStart
                                     changed = true
                                 }
                             }
                         }
 
                         "trimEnd" -> {
-                            val clip = clips.find {
-                                it.id == dragClipId
-                            }
-
                             if (clip != null) {
                                 val proposedEnd = xToTime(event.x)
                                 val newLength = proposedEnd - clip.startMs
-                                val sourceEnd =
-                                    originalTrimStart + newLength
+                                val sourceEnd = clip.trimStartMs + newLength
 
                                 if (
                                     sourceEnd > clip.trimStartMs &&
@@ -1451,8 +1281,6 @@ class MainActivity : ComponentActivity() {
                     }
 
                     lastX = event.x
-                    lastY = event.y
-
                     refreshTimeline()
                     return true
                 }
@@ -1460,55 +1288,52 @@ class MainActivity : ComponentActivity() {
                 MotionEvent.ACTION_UP,
                 MotionEvent.ACTION_CANCEL -> {
                     if (changed && dragMode != "playhead") {
-                        undoStack.addLast(
-                            snapshotFromTouch(
-                                dragClipId,
-                                originalStart,
-                                originalTrack,
-                                originalTrimStart,
-                                originalTrimEnd
-                            )
-                        )
+                        undoStack.addLast(beforeDrag)
+                        while (undoStack.size > 30) undoStack.removeFirst()
+                        redoStack.clear()
+                        saveLocalProject()
                     }
 
                     dragMode = "none"
                     parent?.requestDisallowInterceptTouchEvent(false)
-
                     refreshTimeline()
-                    saveLocalProject()
                     return true
                 }
             }
 
             return true
         }
+    }
 
-        private fun snapshotFromTouch(
-            id: Long?,
-            start: Long,
-            track: Int,
-            trimStart: Long,
-            trimEnd: Long
-        ): String {
-            /*
-             * تعديلات السحب تكون قد طُبقت بالفعل.
-             * سجل التراجع الخاص بالسحب محدود في هذه النسخة.
-             */
-            return projectJson()
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+
+        if (requestCode == REQUEST_MICROPHONE) {
+            if (
+                grantResults.isNotEmpty() &&
+                grantResults[0] == PackageManager.PERMISSION_GRANTED
+            ) {
+                startRecording()
+            } else {
+                showStatus("يلزم السماح باستخدام الميكروفون للتسجيل")
+            }
         }
     }
 
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
+        releasePlayer()
 
         try {
-            player?.release()
             recorder?.release()
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+        }
 
-        player = null
         recorder = null
-
         super.onDestroy()
     }
 }
