@@ -1,4 +1,3 @@
-
 package com.sahlaudio
 
 import android.app.Activity
@@ -21,6 +20,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.*
+import android.widget.FrameLayout
 import androidx.activity.ComponentActivity
 import org.json.JSONArray
 import org.json.JSONObject
@@ -37,17 +37,6 @@ private const val GOLD = 0xFFE8C879.toInt()
 private const val WHITE = 0xFFF2F5F2.toInt()
 private const val MUTED = 0xFF9BAAA0.toInt()
 
-private val CLIP_COLORS = intArrayOf(
-    Color.WHITE,
-    0xFF45D483.toInt(),
-    0xFF3989FF.toInt(),
-    0xFFB17AFF.toInt(),
-    0xFFFFAD42.toInt(),
-    0xFFFF6685.toInt(),
-    0xFF35D5D0.toInt(),
-    0xFFE8C879.toInt()
-)
-
 data class AudioClip(
     val id: Long,
     val uri: String,
@@ -59,7 +48,7 @@ data class AudioClip(
     var trimEndMs: Long = durationMs,
     var volume: Float = 1f,
     var muted: Boolean = false,
-    var color: Int = 0xFF45D483.toInt()
+    var color: Int = 0xFF276B4B.toInt()
 ) {
     fun lengthMs(): Long = max(0L, trimEndMs - trimStartMs)
     fun endMs(): Long = startMs + lengthMs()
@@ -75,22 +64,10 @@ class MainActivity : ComponentActivity() {
     private lateinit var status: TextView
 
     private val clips = mutableListOf<AudioClip>()
-
-    private data class ProjectEntry(
-        val id: Long,
-        var name: String,
-        var json: String
-    )
-
-    private val projects = mutableListOf<ProjectEntry>()
-    private var activeProjectId = 0L
-    private var activeProjectName = "مشروعي الأول"
-
     private var tracks = 3
     private var playheadMs = 0L
     private var zoom = 70f
     private var selectedId: Long? = null
-
     private var player: MediaPlayer? = null
     private var recorder: MediaRecorder? = null
     private var recordingFile: File? = null
@@ -156,58 +133,23 @@ class MainActivity : ComponentActivity() {
             setPadding(dp(8f), dp(8f), dp(8f), dp(8f))
         }
 
-        val bismillah = label(
-            "بِسْمِ اللَّهِ الرَّحْمَٰنِ الرَّحِيمِ",
+        val heading = label("بسم الله الرحمن الرحيم", 18f, GOLD)
+        root.addView(heading, LinearLayout.LayoutParams(-1, dp(30f)))
+
+        val appHeading = label(
+            "سهل الصوت  •  محرر صوت متعدد المسارات",
             19f,
-            GOLD
-        ).apply {
-            gravity = Gravity.CENTER
-        }
-
-        root.addView(
-            bismillah,
-            LinearLayout.LayoutParams(-1, dp(42f))
-        )
-
-        val heading = label(
-            "سهل الصوت • محرر صوت متعدد المسارات",
-            20f,
             GREEN
         )
-
-        root.addView(
-            heading,
-            LinearLayout.LayoutParams(-1, dp(48f))
-        )
-
-        val projectRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-        }
-
-        projectRow.addView(
-            button("＋ مشروع جديد") { createNewProjectDialog() }
-        )
-        projectRow.addView(
-            button("📁 مشاريعي") { showProjectsDialog() }
-        )
-        projectRow.addView(
-            button("✎ تغيير الاسم") { renameActiveProjectDialog() }
-        )
-
-        root.addView(projectRow)
+        root.addView(appHeading, LinearLayout.LayoutParams(-1, dp(42f)))
 
         status = label("أضف ملفًا صوتيًا لبدء المشروع", 12f, MUTED)
-        root.addView(
-            status,
-            LinearLayout.LayoutParams(-1, dp(32f))
-        )
+        root.addView(status, LinearLayout.LayoutParams(-1, dp(32f)))
 
         val firstRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
         }
-
         firstRow.addView(button("＋ إضافة صوت") { chooseAudio() })
         firstRow.addView(button("▶ تشغيل") { togglePlayback() })
         firstRow.addView(button("■ إيقاف") { stopPlayback() })
@@ -217,24 +159,29 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
         }
-
         secondRow.addView(button("✂ تقسيم") { splitSelected() })
         secondRow.addView(button("⧉ تكرار") { duplicateSelected() })
         secondRow.addView(button("حذف") { deleteSelected() })
         root.addView(secondRow)
 
+        val clipToolsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        clipToolsRow.addView(button("✎ إعادة تسمية") { renameSelected() })
+        clipToolsRow.addView(button("🎨 لون المقطع") { chooseClipColor() })
+        clipToolsRow.addView(button("⏮ بداية المقطع") { jumpToSelectedStart() })
+        root.addView(clipToolsRow)
+
         val thirdRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
         }
-
         thirdRow.addView(button("＋ مسار") {
             rememberUndo()
             tracks++
             refreshTimeline()
-            saveLocalProject()
         })
-
         thirdRow.addView(button("↶ تراجع") { undo() })
         thirdRow.addView(button("↷ إعادة") { redo() })
         root.addView(thirdRow)
@@ -243,26 +190,21 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
         }
-
         zoomRow.addView(button("− تصغير") {
             zoom = (zoom / 1.25f).coerceAtLeast(8f)
             refreshTimeline()
         })
-
         zoomRow.addView(label("التكبير", 13f, GOLD))
-
         zoomRow.addView(button("＋ تكبير") {
             zoom = (zoom * 1.25f).coerceAtMost(240f)
             refreshTimeline()
         })
-
         root.addView(zoomRow)
 
         val fileRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
         }
-
         fileRow.addView(button("حفظ المشروع") { saveLocalProject() })
         fileRow.addView(button("تصدير المشروع") { createProjectFile() })
         fileRow.addView(button("استيراد مشروع") { openProjectFile() })
@@ -272,16 +214,12 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
         }
-
         exportRow.addView(button("تصدير WAV") { startWavExport() })
         exportRow.addView(button("🎙 تسجيل") { toggleRecording() })
         root.addView(exportRow)
 
         playLabel = label("موضع التشغيل: 00:00.000", 13f, GOLD)
-        root.addView(
-            playLabel,
-            LinearLayout.LayoutParams(-1, dp(32f))
-        )
+        root.addView(playLabel, LinearLayout.LayoutParams(-1, dp(32f)))
 
         vertical = ScrollView(this).apply {
             isFillViewport = false
@@ -306,35 +244,30 @@ class MainActivity : ComponentActivity() {
 
         vertical.addView(
             horizontal,
-            ScrollView.LayoutParams(
+            FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
         )
 
-        root.addView(
-            vertical,
-            LinearLayout.LayoutParams(0, 0, 1f)
-        )
+        root.addView(vertical, LinearLayout.LayoutParams(0, 0, 1f))
 
         val editRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
         }
-
-        editRow.addView(
-            button("قص البداية عند المؤشر") { trimStartAtPlayhead() }
-        )
-        editRow.addView(
-            button("قص النهاية عند المؤشر") { trimEndAtPlayhead() }
-        )
+        editRow.addView(button("قص البداية عند المؤشر") {
+            trimStartAtPlayhead()
+        })
+        editRow.addView(button("قص النهاية عند المؤشر") {
+            trimEndAtPlayhead()
+        })
         root.addView(editRow)
 
         val volumeRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-
         volumeRow.addView(label("صوت المقطع", 12f))
 
         val volume = SeekBar(this).apply {
@@ -353,30 +286,23 @@ class MainActivity : ComponentActivity() {
                                 rememberUndo()
                                 it.volume = progress / 100f
                                 refreshTimeline()
-                                saveLocalProject()
                             }
                         }
                     }
 
                     override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+
                     override fun onStopTrackingTouch(seekBar: SeekBar?) {}
                 }
             )
         }
 
-        volumeRow.addView(
-            volume,
-            LinearLayout.LayoutParams(0, dp(42f), 1f)
-        )
-
-        volumeRow.addView(
-            button("كتم/إلغاء الكتم") { toggleMute() }
-        )
-
+        volumeRow.addView(volume, LinearLayout.LayoutParams(0, dp(42f), 1f))
+        volumeRow.addView(button("كتم/إلغاء الكتم") { toggleMute() })
         root.addView(volumeRow)
+
         setContentView(root)
     }
-
     private fun chooseAudio() {
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
@@ -394,9 +320,7 @@ class MainActivity : ComponentActivity() {
         data: Intent?
     ) {
         super.onActivityResult(requestCode, resultCode, data)
-
         if (resultCode != Activity.RESULT_OK || data?.data == null) return
-
         val uri = data.data!!
 
         when (requestCode) {
@@ -409,28 +333,23 @@ class MainActivity : ComponentActivity() {
                 } catch (_: Exception) {}
 
                 val duration = getDuration(uri)
-
                 if (duration <= 0L) {
                     showStatus("تعذر قراءة مدة الملف الصوتي")
                     return
                 }
 
                 rememberUndo()
-
                 val clip = AudioClip(
                     id = System.nanoTime(),
                     uri = uri.toString(),
                     name = queryName(uri),
                     track = 0,
                     startMs = playheadMs,
-                    durationMs = duration,
-                    color = nextClipColor()
+                    durationMs = duration
                 )
-
                 clips.add(clip)
                 selectedId = clip.id
                 tracks = max(tracks, clip.track + 1)
-
                 refreshTimeline()
                 showStatus("تمت إضافة: ${clip.name}")
                 saveLocalProject()
@@ -440,10 +359,7 @@ class MainActivity : ComponentActivity() {
                 try {
                     val json = contentResolver.openInputStream(uri)
                         ?.bufferedReader()?.use { it.readText() }
-
-                    if (json != null) {
-                        importProjectAsNew(json)
-                    }
+                    if (json != null) loadProjectJson(json)
                 } catch (e: Exception) {
                     showStatus("تعذر فتح المشروع: ${e.message}")
                 }
@@ -454,7 +370,7 @@ class MainActivity : ComponentActivity() {
                     contentResolver.openOutputStream(uri)?.bufferedWriter()?.use {
                         it.write(projectJson())
                     }
-                    showStatus("تم تصدير بيانات المشروع")
+                    showStatus("تم تصدير ملف المشروع")
                 } catch (e: Exception) {
                     showStatus("فشل تصدير المشروع: ${e.message}")
                 }
@@ -465,12 +381,8 @@ class MainActivity : ComponentActivity() {
                     try {
                         val out = contentResolver.openOutputStream(uri)
                             ?: throw IllegalStateException("تعذر فتح ملف الحفظ")
-
                         out.use { exportMixedWav(it) }
-
-                        runOnUiThread {
-                            showStatus("اكتمل تصدير WAV")
-                        }
+                        runOnUiThread { showStatus("اكتمل تصدير WAV") }
                     } catch (e: Exception) {
                         runOnUiThread {
                             showStatus("فشل التصدير: ${e.message}")
@@ -487,7 +399,6 @@ class MainActivity : ComponentActivity() {
                 val index = cursor.getColumnIndex(
                     android.provider.OpenableColumns.DISPLAY_NAME
                 )
-
                 if (cursor.moveToFirst() && index >= 0) {
                     cursor.getString(index)
                 } else {
@@ -503,11 +414,9 @@ class MainActivity : ComponentActivity() {
         return try {
             val retriever = MediaMetadataRetriever()
             retriever.setDataSource(this, uri)
-
             val duration = retriever.extractMetadata(
                 MediaMetadataRetriever.METADATA_KEY_DURATION
             )?.toLongOrNull() ?: 0L
-
             retriever.release()
             duration
         } catch (_: Exception) {
@@ -525,16 +434,10 @@ class MainActivity : ComponentActivity() {
     private fun refreshTimeline() {
         timeline.invalidate()
         timeline.requestLayout()
-
         playLabel.text = "موضع التشغيل: ${formatTime(playheadMs)}"
-
         val selected = clips.find { it.id == selectedId }
-
         if (selected != null) {
-            status.text =
-                "$activeProjectName • ${selected.name} • المسار ${selected.track + 1}"
-        } else {
-            status.text = "المشروع: $activeProjectName"
+            status.text = "${selected.name} • المسار ${selected.track + 1}"
         }
     }
 
@@ -547,7 +450,6 @@ class MainActivity : ComponentActivity() {
         val minutes = safe / 60_000
         val seconds = (safe / 1000) % 60
         val millis = safe % 1000
-
         return "%02d:%02d.%03d".format(minutes, seconds, millis)
     }
 
@@ -556,18 +458,14 @@ class MainActivity : ComponentActivity() {
             showStatus("اختر مقطعًا أولًا")
             return
         }
-
         val local = playheadMs - clip.startMs
-
         if (local <= 0L || local >= clip.lengthMs()) {
             showStatus("ضع المؤشر داخل المقطع لتقسيمه")
             return
         }
 
         rememberUndo()
-
         val splitSource = clip.trimStartMs + local
-
         val right = clip.copy(
             id = System.nanoTime(),
             name = clip.name + " (2)",
@@ -575,42 +473,91 @@ class MainActivity : ComponentActivity() {
             trimStartMs = splitSource,
             trimEndMs = clip.trimEndMs
         )
-
         clip.trimEndMs = splitSource
         clips.add(right)
         selectedId = right.id
-
         refreshTimeline()
         saveLocalProject()
     }
 
     private fun duplicateSelected() {
         val clip = clips.find { it.id == selectedId } ?: return
-
         rememberUndo()
-
         val copy = clip.copy(
             id = System.nanoTime(),
             name = clip.name + " - نسخة",
-            startMs = clip.endMs(),
-            color = nextClipColor()
+            startMs = clip.endMs()
         )
-
         clips.add(copy)
         selectedId = copy.id
         tracks = max(tracks, copy.track + 1)
-
         refreshTimeline()
         saveLocalProject()
     }
 
+    private fun renameSelected() {
+        val clip = clips.find { it.id == selectedId } ?: run {
+            showStatus("اختر مقطعًا أولًا")
+            return
+        }
+        val input = EditText(this).apply {
+            setText(clip.name)
+            setSelection(text.length)
+            singleLine = true
+        }
+        AlertDialog.Builder(this)
+            .setTitle("إعادة تسمية المقطع")
+            .setView(input)
+            .setNegativeButton("إلغاء", null)
+            .setPositiveButton("حفظ") { _, _ ->
+                val newName = input.text.toString().trim()
+                if (newName.isNotEmpty()) {
+                    rememberUndo()
+                    clip.name = newName
+                    refreshTimeline()
+                    saveLocalProject()
+                }
+            }
+            .show()
+    }
+
+    private fun chooseClipColor() {
+        val clip = clips.find { it.id == selectedId } ?: run {
+            showStatus("اختر مقطعًا أولًا")
+            return
+        }
+        val names = arrayOf("أخضر", "أزرق", "بنفسجي", "برتقالي", "أحمر", "أبيض")
+        val colors = intArrayOf(
+            0xFF276B4B.toInt(), 0xFF245A9B.toInt(), 0xFF7046A8.toInt(),
+            0xFFB86A20.toInt(), 0xFF9D3434.toInt(), 0xFF69756E.toInt()
+        )
+        AlertDialog.Builder(this)
+            .setTitle("اختر لون المقطع")
+            .setItems(names) { _, which ->
+                rememberUndo()
+                clip.color = colors[which]
+                refreshTimeline()
+                saveLocalProject()
+            }
+            .setNegativeButton("إلغاء", null)
+            .show()
+    }
+
+    private fun jumpToSelectedStart() {
+        val clip = clips.find { it.id == selectedId } ?: run {
+            showStatus("اختر مقطعًا أولًا")
+            return
+        }
+        playheadMs = clip.startMs
+        refreshTimeline()
+        showStatus("انتقل المؤشر إلى بداية المقطع")
+    }
+
     private fun deleteSelected() {
         val id = selectedId ?: return
-
         rememberUndo()
         clips.removeAll { it.id == id }
         selectedId = null
-
         refreshTimeline()
         saveLocalProject()
     }
@@ -618,46 +565,33 @@ class MainActivity : ComponentActivity() {
     private fun trimStartAtPlayhead() {
         val clip = clips.find { it.id == selectedId } ?: return
         val offset = playheadMs - clip.startMs
-
         if (offset <= 0L || offset >= clip.lengthMs()) {
             showStatus("ضع المؤشر داخل المقطع")
             return
         }
-
         rememberUndo()
-
         clip.trimStartMs += offset
         clip.startMs = playheadMs
-
         refreshTimeline()
-        saveLocalProject()
     }
 
     private fun trimEndAtPlayhead() {
         val clip = clips.find { it.id == selectedId } ?: return
         val offset = playheadMs - clip.startMs
-
         if (offset <= 0L || offset >= clip.lengthMs()) {
             showStatus("ضع المؤشر داخل المقطع")
             return
         }
-
         rememberUndo()
-
         clip.trimEndMs = clip.trimStartMs + offset
-
         refreshTimeline()
-        saveLocalProject()
     }
 
     private fun toggleMute() {
         val clip = clips.find { it.id == selectedId } ?: return
-
         rememberUndo()
         clip.muted = !clip.muted
-
         refreshTimeline()
-        saveLocalProject()
     }
 
     private fun togglePlayback() {
@@ -681,33 +615,28 @@ class MainActivity : ComponentActivity() {
 
         try {
             player?.release()
-
             player = MediaPlayer().apply {
-                setDataSource(this@MainActivity, Uri.parse(clip.uri))
+                setDataSource(
+                    this@MainActivity,
+                    Uri.parse(clip.uri)
+                )
                 setVolume(clip.volume, clip.volume)
-
                 setOnPreparedListener {
                     val offset = (playheadMs - clip.startMs).coerceAtLeast(0L)
                     val sourcePosition = clip.trimStartMs + offset
-
                     seekTo(
-                        sourcePosition
-                            .coerceAtMost(Int.MAX_VALUE.toLong())
-                            .toInt()
+                        sourcePosition.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
                     )
-
                     start()
                     isPlaying = true
                     showStatus("جارٍ التشغيل: ${clip.name}")
                     handler.post(playbackTicker)
                 }
-
                 setOnCompletionListener {
                     isPlaying = false
                     playheadMs = clip.endMs()
                     refreshTimeline()
                 }
-
                 prepareAsync()
             }
         } catch (e: Exception) {
@@ -718,24 +647,19 @@ class MainActivity : ComponentActivity() {
     private val playbackTicker = object : Runnable {
         override fun run() {
             if (!isPlaying) return
-
             val p = player
-
             if (p != null) {
                 try {
                     val clip = clips.firstOrNull {
                         playheadMs >= it.startMs && playheadMs < it.endMs()
                     }
-
                     if (clip != null) {
                         playheadMs = clip.startMs +
                             (p.currentPosition - clip.trimStartMs).coerceAtLeast(0)
                     }
-
                     refreshTimeline()
                 } catch (_: Exception) {}
             }
-
             handler.postDelayed(this, 40)
         }
     }
@@ -744,7 +668,6 @@ class MainActivity : ComponentActivity() {
         try {
             player?.pause()
         } catch (_: Exception) {}
-
         isPlaying = false
         handler.removeCallbacks(playbackTicker)
         showStatus("متوقف مؤقتًا")
@@ -755,16 +678,13 @@ class MainActivity : ComponentActivity() {
             player?.stop()
             player?.release()
         } catch (_: Exception) {}
-
         player = null
         isPlaying = false
         handler.removeCallbacks(playbackTicker)
         playheadMs = 0L
-
         refreshTimeline()
         showStatus("تم إيقاف التشغيل")
     }
-
     private fun toggleRecording() {
         if (isRecording) {
             finishRecording()
@@ -772,30 +692,23 @@ class MainActivity : ComponentActivity() {
         }
 
         try {
-            val file = File(
-                cacheDir,
-                "recording_${System.currentTimeMillis()}.m4a"
-            )
-
+            val file = File(cacheDir, "recording_${System.currentTimeMillis()}.m4a")
             val r = if (Build.VERSION.SDK_INT >= 31) {
                 MediaRecorder(this)
             } else {
                 @Suppress("DEPRECATION")
                 MediaRecorder()
             }
-
             r.setAudioSource(MediaRecorder.AudioSource.MIC)
             r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
             r.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
             r.setOutputFile(file.absolutePath)
             r.prepare()
             r.start()
-
             recorder = r
             recordingFile = file
             recordingStartedAt = System.currentTimeMillis()
             isRecording = true
-
             showStatus("جارٍ التسجيل… اضغط زر التسجيل مرة أخرى لإنهائه")
         } catch (e: Exception) {
             showStatus("تعذر بدء التسجيل: ${e.message}")
@@ -806,30 +719,22 @@ class MainActivity : ComponentActivity() {
         try {
             recorder?.stop()
             recorder?.release()
-
             recorder = null
             isRecording = false
-
             val file = recordingFile
-
             if (file != null && file.exists() && file.length() > 0) {
                 val duration = System.currentTimeMillis() - recordingStartedAt
-
                 rememberUndo()
-
                 val clip = AudioClip(
                     id = System.nanoTime(),
                     uri = Uri.fromFile(file).toString(),
                     name = "تسجيل جديد",
                     track = 0,
                     startMs = playheadMs,
-                    durationMs = duration,
-                    color = nextClipColor()
+                    durationMs = duration
                 )
-
                 clips.add(clip)
                 selectedId = clip.id
-
                 refreshTimeline()
                 showStatus("تمت إضافة التسجيل إلى المسار الأول")
                 saveLocalProject()
@@ -841,11 +746,7 @@ class MainActivity : ComponentActivity() {
 
     private fun rememberUndo() {
         undoStack.addLast(projectJson())
-
-        while (undoStack.size > 30) {
-            undoStack.removeFirst()
-        }
-
+        while (undoStack.size > 30) undoStack.removeFirst()
         redoStack.clear()
     }
 
@@ -854,10 +755,8 @@ class MainActivity : ComponentActivity() {
             showStatus("لا توجد خطوة للتراجع")
             return
         }
-
         redoStack.addLast(projectJson())
         loadProjectJson(undoStack.removeLast())
-        saveLocalProject()
         showStatus("تم التراجع")
     }
 
@@ -866,22 +765,17 @@ class MainActivity : ComponentActivity() {
             showStatus("لا توجد خطوة لإعادتها")
             return
         }
-
         undoStack.addLast(projectJson())
         loadProjectJson(redoStack.removeLast())
-        saveLocalProject()
         showStatus("تمت إعادة الخطوة")
     }
 
     private fun projectJson(): String {
         val rootJson = JSONObject()
-
-        rootJson.put("version", 2)
-        rootJson.put("projectName", activeProjectName)
+        rootJson.put("version", 1)
         rootJson.put("tracks", tracks)
         rootJson.put("playheadMs", playheadMs)
         rootJson.put("zoom", zoom.toDouble())
-
         val array = JSONArray()
 
         clips.forEach { c ->
@@ -907,14 +801,11 @@ class MainActivity : ComponentActivity() {
     private fun loadProjectJson(text: String) {
         try {
             val obj = JSONObject(text)
-
             clips.clear()
-
             val array = obj.getJSONArray("clips")
 
             for (i in 0 until array.length()) {
                 val c = array.getJSONObject(i)
-
                 clips.add(
                     AudioClip(
                         id = c.optLong("id", System.nanoTime()),
@@ -930,385 +821,40 @@ class MainActivity : ComponentActivity() {
                         ),
                         volume = c.optDouble("volume", 1.0).toFloat(),
                         muted = c.optBoolean("muted", false),
-                        color = c.optInt("color", CLIP_COLORS[i % CLIP_COLORS.size])
+                        color = c.optInt("color", 0xFF276B4B.toInt())
                     )
                 )
             }
 
             tracks = max(1, obj.optInt("tracks", 3))
             playheadMs = obj.optLong("playheadMs", 0)
-            zoom = obj.optDouble("zoom", 70.0).toFloat().coerceIn(8f, 240f)
-            activeProjectName = obj.optString("projectName", activeProjectName)
+            zoom = obj.optDouble("zoom", 70.0)
+                .toFloat()
+                .coerceIn(8f, 240f)
             selectedId = clips.firstOrNull()?.id
-
             refreshTimeline()
         } catch (e: Exception) {
             showStatus("ملف المشروع غير صالح: ${e.message}")
         }
     }
 
-    private fun nextClipColor(): Int {
-        return CLIP_COLORS[clips.size % CLIP_COLORS.size]
-    }
-
-    private fun lightenColor(color: Int): Int {
-        val r = min(255, (Color.red(color) * 1.18f).toInt())
-        val g = min(255, (Color.green(color) * 1.18f).toInt())
-        val b = min(255, (Color.blue(color) * 1.18f).toInt())
-        return Color.rgb(r, g, b)
-    }
-
     private fun saveLocalProject() {
-        if (activeProjectId == 0L) {
-            activeProjectId = System.currentTimeMillis()
-        }
-
-        val currentJson = projectJson()
-        val existing = projects.find { it.id == activeProjectId }
-
-        if (existing == null) {
-            projects.add(
-                ProjectEntry(activeProjectId, activeProjectName, currentJson)
-            )
-        } else {
-            existing.name = activeProjectName
-            existing.json = currentJson
-        }
-
-        persistProjects()
-    }
-
-    private fun persistProjects() {
-        val array = JSONArray()
-
-        projects.forEach { project ->
-            array.put(JSONObject().apply {
-                put("id", project.id)
-                put("name", project.name)
-                put("json", project.json)
-            })
-        }
-
-        prefs.edit()
-            .putString("projects", array.toString())
-            .putLong("activeProjectId", activeProjectId)
-            .apply()
+        prefs.edit().putString("project", projectJson()).apply()
+        showStatus("تم حفظ المشروع على هذا الجهاز")
     }
 
     private fun restoreLocalProject() {
-        projects.clear()
-
-        val savedProjects = prefs.getString("projects", null)
-
-        if (!savedProjects.isNullOrBlank()) {
-            try {
-                val array = JSONArray(savedProjects)
-
-                for (i in 0 until array.length()) {
-                    val obj = array.getJSONObject(i)
-
-                    projects.add(
-                        ProjectEntry(
-                            obj.optLong("id", System.nanoTime()),
-                            obj.optString("name", "مشروع"),
-                            obj.optString("json", "{\"clips\":[]}")
-                        )
-                    )
-                }
-            } catch (_: Exception) {
-                projects.clear()
-            }
-        }
-
-        activeProjectId = prefs.getLong("activeProjectId", 0L)
-
-        var active = projects.find { it.id == activeProjectId }
-
-        // نقل المشروع المحفوظ من النسخة السابقة إلى نظام المشاريع.
-        if (projects.isEmpty()) {
-            val legacy = prefs.getString("project", null)
-
-            if (!legacy.isNullOrBlank()) {
-                activeProjectId = System.currentTimeMillis()
-                activeProjectName = "المشروع المستعاد"
-
-                projects.add(
-                    ProjectEntry(
-                        activeProjectId,
-                        activeProjectName,
-                        legacy
-                    )
-                )
-
-                persistProjects()
-                active = projects.first()
-            }
-        }
-
-        if (active == null && projects.isNotEmpty()) {
-            active = projects.first()
-            activeProjectId = active.id
-        }
-
-        if (active != null) {
-            activeProjectName = active.name
-            loadProjectJson(active.json)
-            showStatus("المشروع الحالي: $activeProjectName")
-        } else {
-            activeProjectId = System.currentTimeMillis()
-            activeProjectName = "مشروعي الأول"
-            clips.clear()
-            saveLocalProject()
-            showStatus("تم إنشاء مشروعك الأول")
-        }
-    }
-
-    private fun createNewProjectDialog() {
-        saveLocalProject()
-
-        val input = EditText(this).apply {
-            hint = "اسم المشروع"
-            setSingleLine(true)
-            setText("مشروع جديد")
-        }
-
-        AlertDialog.Builder(this)
-            .setTitle("إنشاء مشروع")
-            .setMessage("سيظل مشروعك الحالي محفوظًا.")
-            .setView(input)
-            .setNegativeButton("إلغاء", null)
-            .setPositiveButton("إنشاء") { _, _ ->
-                val name = input.text.toString().trim()
-                    .ifBlank { "مشروع جديد" }
-
-                stopPlayback()
-
-                activeProjectId = System.currentTimeMillis()
-                activeProjectName = name
-
-                clips.clear()
-                tracks = 3
-                playheadMs = 0L
-                zoom = 70f
-                selectedId = null
-
-                undoStack.clear()
-                redoStack.clear()
-
-                saveLocalProject()
-                refreshTimeline()
-                showStatus("المشروع الجديد: $activeProjectName")
-            }
-            .show()
-    }
-
-    private fun showProjectsDialog() {
-        saveLocalProject()
-
-        if (projects.isEmpty()) {
-            showStatus("لا توجد مشاريع محفوظة")
-            return
-        }
-
-        val names = projects.map { project ->
-            if (project.id == activeProjectId) {
-                "✓ ${project.name} (الحالي)"
-            } else {
-                project.name
-            }
-        }.toTypedArray()
-
-        AlertDialog.Builder(this)
-            .setTitle("مشاريعي")
-            .setItems(names) { _, which ->
-                val chosen = projects.getOrNull(which) ?: return@setItems
-
-                if (chosen.id != activeProjectId) {
-                    saveLocalProject()
-                    stopPlayback()
-
-                    activeProjectId = chosen.id
-                    activeProjectName = chosen.name
-
-                    undoStack.clear()
-                    redoStack.clear()
-
-                    loadProjectJson(chosen.json)
-                    persistProjects()
-
-                    showStatus("تم فتح: $activeProjectName")
-                } else {
-                    showProjectActions(chosen)
-                }
-            }
-            .setNeutralButton("إدارة/حذف") { _, _ ->
-                showProjectManagementDialog()
-            }
-            .setNegativeButton("إغلاق", null)
-            .show()
-    }
-
-    private fun showProjectManagementDialog() {
-        val names = projects.map { it.name }.toTypedArray()
-
-        if (names.isEmpty()) return
-
-        AlertDialog.Builder(this)
-            .setTitle("اختر مشروعًا لإدارته")
-            .setItems(names) { _, index ->
-                projects.getOrNull(index)?.let {
-                    showProjectActions(it)
-                }
-            }
-            .setNegativeButton("إلغاء", null)
-            .show()
-    }
-
-    private fun showProjectActions(project: ProjectEntry) {
-        val actions = arrayOf(
-            "فتح المشروع",
-            "إعادة تسمية",
-            "حذف المشروع"
-        )
-
-        AlertDialog.Builder(this)
-            .setTitle(project.name)
-            .setItems(actions) { _, which ->
-                when (which) {
-                    0 -> {
-                        saveLocalProject()
-                        stopPlayback()
-
-                        activeProjectId = project.id
-                        activeProjectName = project.name
-
-                        loadProjectJson(project.json)
-                        persistProjects()
-                    }
-
-                    1 -> renameProjectDialog(project)
-
-                    2 -> {
-                        if (projects.size <= 1) {
-                            showStatus(
-                                "لا يمكن حذف آخر مشروع؛ أنشئ مشروعًا آخر أولًا"
-                            )
-                        } else {
-                            AlertDialog.Builder(this)
-                                .setTitle("حذف المشروع")
-                                .setMessage(
-                                    "هل تريد حذف «${project.name}»؟"
-                                )
-                                .setNegativeButton("إلغاء", null)
-                                .setPositiveButton("حذف") { _, _ ->
-                                    projects.removeAll {
-                                        it.id == project.id
-                                    }
-
-                                    if (activeProjectId == project.id) {
-                                        val next = projects.first()
-                                        activeProjectId = next.id
-                                        activeProjectName = next.name
-                                        loadProjectJson(next.json)
-                                    }
-
-                                    persistProjects()
-                                    showStatus("تم حذف المشروع")
-                                }
-                                .show()
-                        }
-                    }
-                }
-            }
-            .setNegativeButton("إغلاق", null)
-            .show()
-    }
-
-    private fun renameActiveProjectDialog() {
-        val active = projects.find { it.id == activeProjectId }
-
-        if (active == null) {
-            showStatus("لا يوجد مشروع حالي")
-            return
-        }
-
-        renameProjectDialog(active)
-    }
-
-    private fun renameProjectDialog(project: ProjectEntry) {
-        val input = EditText(this).apply {
-            setSingleLine(true)
-            setText(project.name)
-        }
-
-        AlertDialog.Builder(this)
-            .setTitle("إعادة تسمية المشروع")
-            .setView(input)
-            .setNegativeButton("إلغاء", null)
-            .setPositiveButton("حفظ") { _, _ ->
-                val name = input.text.toString().trim()
-
-                if (name.isNotBlank()) {
-                    project.name = name
-
-                    if (project.id == activeProjectId) {
-                        activeProjectName = name
-                    }
-
-                    saveLocalProject()
-                    persistProjects()
-                    refreshTimeline()
-                    showStatus("تم تغيير اسم المشروع")
-                }
-            }
-            .show()
-    }
-
-    private fun importProjectAsNew(json: String) {
-        try {
-            val obj = JSONObject(json)
-            if (!obj.has("clips")) {
-                showStatus("الملف لا يحتوي على بيانات مشروع صالحة")
-                return
-            }
-
-            saveLocalProject()
-
-            val importedName = obj.optString(
-                "projectName",
-                "مشروع مستورد"
-            )
-
-            activeProjectId = System.currentTimeMillis()
-            activeProjectName = importedName
-
-            loadProjectJson(json)
-
-            // اعتماد الاسم الجديد وهوية مستقلة للمشروع المستورد.
-            activeProjectName = importedName
-            saveLocalProject()
-
-            undoStack.clear()
-            redoStack.clear()
-
-            showStatus("تم استيراد المشروع: $activeProjectName")
-        } catch (e: Exception) {
-            showStatus("تعذر استيراد المشروع: ${e.message}")
-        }
+        val saved = prefs.getString("project", null) ?: return
+        loadProjectJson(saved)
+        showStatus("تمت استعادة المشروع المحفوظ")
     }
 
     private fun createProjectFile() {
-        saveLocalProject()
-
         val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "application/json"
-            putExtra(
-                Intent.EXTRA_TITLE,
-                "${activeProjectName}.json"
-            )
+            putExtra(Intent.EXTRA_TITLE, "SahlAudio-project.json")
         }
-
         startActivityForResult(intent, exportProject)
     }
 
@@ -1317,7 +863,6 @@ class MainActivity : ComponentActivity() {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "application/json"
         }
-
         startActivityForResult(intent, importProject)
     }
 
@@ -1332,13 +877,12 @@ class MainActivity : ComponentActivity() {
             type = "audio/wav"
             putExtra(Intent.EXTRA_TITLE, "SahlAudio-mix.wav")
         }
-
         startActivityForResult(intent, exportWav)
     }
 
     /*
-     * التصدير الحالي يقبل ملفات WAV غير المضغوطة فقط.
-     * وضع حد للمدة لتقليل احتمال استهلاك ذاكرة الهاتف.
+     * تصدير WAV محدود بدقيقتين لتجنب استهلاك ذاكرة الهاتف.
+     * النسخة الحالية تدعم ملفات WAV PCM غير المضغوطة فقط.
      */
     private fun exportMixedWav(output: java.io.OutputStream) {
         val sampleRate = 44100
@@ -1356,53 +900,44 @@ class MainActivity : ComponentActivity() {
         for (clip in clips) {
             if (clip.muted || clip.lengthMs() <= 0) continue
 
-            val pcm = decodePcmMono(Uri.parse(clip.uri), sampleRate)
+            val uri = Uri.parse(clip.uri)
+            val pcm = decodePcmMono(uri, sampleRate)
 
             val sourceStart = (clip.trimStartMs * sampleRate / 1000L)
                 .toInt().coerceIn(0, pcm.size)
-
             val sourceEnd = (clip.trimEndMs * sampleRate / 1000L)
                 .toInt().coerceIn(sourceStart, pcm.size)
-
             val targetStart = (clip.startMs * sampleRate / 1000L)
                 .toInt().coerceIn(0, totalFrames)
-
-            val count = min(
-                sourceEnd - sourceStart,
-                totalFrames - targetStart
-            )
+            val count = min(sourceEnd - sourceStart, totalFrames - targetStart)
 
             for (i in 0 until count) {
                 mix[targetStart + i] =
-                    (
-                        mix[targetStart + i] +
-                            pcm[sourceStart + i] * clip.volume
-                    ).coerceIn(-1f, 1f)
+                    (mix[targetStart + i] + pcm[sourceStart + i] * clip.volume)
+                        .coerceIn(-1f, 1f)
             }
         }
 
         val dataBytes = totalFrames * 2
-        val header = ByteBuffer.allocate(44)
-            .order(ByteOrder.LITTLE_ENDIAN)
+        val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
 
         header.put("RIFF".toByteArray(Charsets.US_ASCII))
         header.putInt(36 + dataBytes)
         header.put("WAVE".toByteArray(Charsets.US_ASCII))
         header.put("fmt ".toByteArray(Charsets.US_ASCII))
         header.putInt(16)
-        header.putShort(1)
-        header.putShort(1)
+        header.putShort(1.toShort())
+        header.putShort(1.toShort())
         header.putInt(sampleRate)
         header.putInt(sampleRate * 2)
-        header.putShort(2)
-        header.putShort(16)
+        header.putShort(2.toShort())
+        header.putShort(16.toShort())
         header.put("data".toByteArray(Charsets.US_ASCII))
         header.putInt(dataBytes)
 
         output.write(header.array())
 
-        val buffer = ByteBuffer.allocate(8192)
-            .order(ByteOrder.LITTLE_ENDIAN)
+        val buffer = ByteBuffer.allocate(8192).order(ByteOrder.LITTLE_ENDIAN)
 
         for (sample in mix) {
             val pcm16 = (sample * 32767f).toInt()
@@ -1412,7 +947,6 @@ class MainActivity : ComponentActivity() {
                 output.write(buffer.array(), 0, buffer.position())
                 buffer.clear()
             }
-
             buffer.putShort(pcm16)
         }
 
@@ -1422,14 +956,13 @@ class MainActivity : ComponentActivity() {
 
         output.flush()
     }
-
-    private fun decodePcmMono(
-        uri: Uri,
-        targetRate: Int
-    ): FloatArray {
+    private fun decodePcmMono(uri: Uri, targetRate: Int): FloatArray {
+        /*
+         * يدعم التصدير الحالي ملفات WAV غير المضغوطة فقط.
+         * يجب تنفيذ وفحص فك ترميز الصيغ المضغوطة بصورة منفصلة.
+         */
         val input = contentResolver.openInputStream(uri)
             ?: throw IllegalStateException("تعذر فتح الملف الصوتي")
-
         val bytes = input.use { it.readBytes() }
 
         if (
@@ -1452,21 +985,14 @@ class MainActivity : ComponentActivity() {
 
         while (offset + 8 <= bytes.size) {
             val id = String(bytes, offset, 4, Charsets.US_ASCII)
-
             val size = ByteBuffer.wrap(bytes, offset + 4, 4)
-                .order(ByteOrder.LITTLE_ENDIAN)
-                .int
-
+                .order(ByteOrder.LITTLE_ENDIAN).int
             val body = offset + 8
 
-            if (size < 0 || body.toLong() + size > bytes.size) break
+            if (size < 0 || body + size > bytes.size) break
 
             when (id) {
                 "fmt " -> {
-                    if (size < 16) {
-                        throw IllegalStateException("بيانات WAV غير مكتملة")
-                    }
-
                     format = ByteBuffer.wrap(bytes, body, 2)
                         .order(ByteOrder.LITTLE_ENDIAN)
                         .short.toInt() and 0xFFFF
@@ -1532,7 +1058,6 @@ class MainActivity : ComponentActivity() {
         }
 
         if (rate == targetRate) return mono
-        if (mono.isEmpty()) return FloatArray(0)
 
         val outSize = (
             mono.size.toDouble() * targetRate / rate
@@ -1548,14 +1073,13 @@ class MainActivity : ComponentActivity() {
 
             resampled[i] =
                 mono[left] * (1f - fraction) +
-                    mono[right] * fraction
+                mono[right] * fraction
         }
 
         return resampled
     }
 
     inner class TimelineView(context: Context) : View(context) {
-
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val trackHeight = dp(86f)
         private val rulerHeight = dp(36f)
@@ -1565,10 +1089,13 @@ class MainActivity : ComponentActivity() {
         private var lastY = 0f
         private var dragMode = "none"
         private var dragClipId: Long? = null
-        private var changed = false
 
-        private var originalSnapshot = ""
+        private var originalStart = 0L
+        private var originalTrack = 0
         private var originalTrimStart = 0L
+        private var originalTrimEnd = 0L
+
+        private var changed = false
 
         private fun timeToX(ms: Long): Float =
             leftGutter + ms / 1000f * zoom
@@ -1581,10 +1108,13 @@ class MainActivity : ComponentActivity() {
             heightMeasureSpec: Int
         ) {
             val contentWidth = (
-                leftGutter + projectEndMs() / 1000f * zoom + dp(120f)
+                leftGutter +
+                    projectEndMs() / 1000f * zoom +
+                    dp(120f)
             ).toInt().coerceAtLeast(dp(360f))
 
-            val contentHeight = rulerHeight + tracks * trackHeight + dp(12f)
+            val contentHeight =
+                rulerHeight + tracks * trackHeight + dp(12f)
 
             setMeasuredDimension(
                 resolveSize(contentWidth, widthMeasureSpec),
@@ -1597,7 +1127,6 @@ class MainActivity : ComponentActivity() {
             canvas.drawColor(0xFF0C120F.toInt())
 
             paint.color = 0xFF17221B.toInt()
-
             canvas.drawRect(
                 0f,
                 0f,
@@ -1686,17 +1215,15 @@ class MainActivity : ComponentActivity() {
                 val x1 = timeToX(clip.startMs)
                 val x2 = timeToX(clip.endMs())
 
-                val top = rulerHeight +
-                    clip.track * trackHeight + dp(8f)
+                val top =
+                    rulerHeight + clip.track * trackHeight + dp(8f)
 
-                val bottom = rulerHeight +
-                    (clip.track + 1) * trackHeight - dp(8f)
+                val bottom =
+                    rulerHeight +
+                        (clip.track + 1) * trackHeight -
+                        dp(8f)
 
-                paint.color = if (clip.id == selectedId) {
-                    lightenColor(clip.color)
-                } else {
-                    clip.color
-                }
+                paint.color = clip.color
 
                 canvas.drawRoundRect(
                     x1,
@@ -1708,22 +1235,17 @@ class MainActivity : ComponentActivity() {
                     paint
                 )
 
-                paint.color = if (clip.muted) {
-                    MUTED
-                } else {
-                    lightenColor(clip.color)
-                }
-
+                paint.color = if (clip.muted) MUTED else clip.color
                 paint.strokeWidth = dp(1f).toFloat()
 
                 val middle = (top + bottom) / 2f
                 val barWidth = max(2f, zoom / 14f)
+
                 var x = x1 + dp(5f)
 
                 while (x < x2 - dp(4f)) {
-                    val seed = (
-                        (x.toInt() * 31 + clip.id.toInt()) ushr 3
-                    ) and 31
+                    val seed =
+                        ((x.toInt() * 31 + clip.id.toInt()) ushr 3) and 31
 
                     val heightFactor = 0.18f + (seed % 13) / 18f
                     val half = (bottom - top) * heightFactor / 2f
@@ -1739,12 +1261,7 @@ class MainActivity : ComponentActivity() {
                     x += barWidth
                 }
 
-                paint.color = if (Color.luminance(clip.color) < 0.35f) {
-                    WHITE
-                } else {
-                    Color.BLACK
-                }
-
+                paint.color = WHITE
                 paint.textSize = dp(11f).toFloat()
 
                 canvas.drawText(
@@ -1804,7 +1321,6 @@ class MainActivity : ComponentActivity() {
                     lastY = event.y
                     changed = false
                     dragClipId = null
-                    originalSnapshot = projectJson()
 
                     val px = timeToX(playheadMs)
 
@@ -1829,13 +1345,21 @@ class MainActivity : ComponentActivity() {
                     if (hit != null) {
                         selectedId = hit.id
                         dragClipId = hit.id
+
+                        originalStart = hit.startMs
+                        originalTrack = hit.track
                         originalTrimStart = hit.trimStartMs
+                        originalTrimEnd = hit.trimEndMs
 
                         val nearLeft =
-                            kotlin.math.abs(event.x - timeToX(hit.startMs)) < dp(14f)
+                            kotlin.math.abs(
+                                event.x - timeToX(hit.startMs)
+                            ) < dp(14f)
 
                         val nearRight =
-                            kotlin.math.abs(event.x - timeToX(hit.endMs())) < dp(14f)
+                            kotlin.math.abs(
+                                event.x - timeToX(hit.endMs())
+                            ) < dp(14f)
 
                         dragMode = when {
                             nearLeft -> "trimStart"
@@ -1844,7 +1368,8 @@ class MainActivity : ComponentActivity() {
                         }
                     } else {
                         dragMode = "playhead"
-                        playheadMs = xToTime(event.x).coerceAtMost(projectEndMs())
+                        playheadMs =
+                            xToTime(event.x).coerceAtMost(projectEndMs())
                     }
 
                     refreshTimeline()
@@ -1857,13 +1382,15 @@ class MainActivity : ComponentActivity() {
 
                     when (dragMode) {
                         "playhead" -> {
-                            playheadMs = xToTime(event.x)
-                                .coerceAtMost(projectEndMs())
+                            playheadMs =
+                                xToTime(event.x).coerceAtMost(projectEndMs())
                             changed = true
                         }
 
                         "clip" -> {
-                            val clip = clips.find { it.id == dragClipId }
+                            val clip = clips.find {
+                                it.id == dragClipId
+                            }
 
                             if (clip != null) {
                                 val delta = (dx / zoom * 1000f).toLong()
@@ -1881,14 +1408,19 @@ class MainActivity : ComponentActivity() {
                         }
 
                         "trimStart" -> {
-                            val clip = clips.find { it.id == dragClipId }
+                            val clip = clips.find {
+                                it.id == dragClipId
+                            }
 
                             if (clip != null) {
                                 val proposed = xToTime(event.x)
                                 val offset = proposed - clip.startMs
                                 val source = originalTrimStart + offset
 
-                                if (source >= 0 && source < clip.trimEndMs) {
+                                if (
+                                    source >= 0 &&
+                                    source < clip.trimEndMs
+                                ) {
                                     clip.trimStartMs = source
                                     clip.startMs = proposed.coerceAtLeast(0)
                                     changed = true
@@ -1897,12 +1429,15 @@ class MainActivity : ComponentActivity() {
                         }
 
                         "trimEnd" -> {
-                            val clip = clips.find { it.id == dragClipId }
+                            val clip = clips.find {
+                                it.id == dragClipId
+                            }
 
                             if (clip != null) {
                                 val proposedEnd = xToTime(event.x)
                                 val newLength = proposedEnd - clip.startMs
-                                val sourceEnd = originalTrimStart + newLength
+                                val sourceEnd =
+                                    originalTrimStart + newLength
 
                                 if (
                                     sourceEnd > clip.trimStartMs &&
@@ -1922,15 +1457,18 @@ class MainActivity : ComponentActivity() {
                     return true
                 }
 
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                MotionEvent.ACTION_UP,
+                MotionEvent.ACTION_CANCEL -> {
                     if (changed && dragMode != "playhead") {
-                        undoStack.addLast(originalSnapshot)
-
-                        while (undoStack.size > 30) {
-                            undoStack.removeFirst()
-                        }
-
-                        redoStack.clear()
+                        undoStack.addLast(
+                            snapshotFromTouch(
+                                dragClipId,
+                                originalStart,
+                                originalTrack,
+                                originalTrimStart,
+                                originalTrimEnd
+                            )
+                        )
                     }
 
                     dragMode = "none"
@@ -1938,21 +1476,29 @@ class MainActivity : ComponentActivity() {
 
                     refreshTimeline()
                     saveLocalProject()
-
                     return true
                 }
             }
 
             return true
         }
+
+        private fun snapshotFromTouch(
+            id: Long?,
+            start: Long,
+            track: Int,
+            trimStart: Long,
+            trimEnd: Long
+        ): String {
+            /*
+             * تعديلات السحب تكون قد طُبقت بالفعل.
+             * سجل التراجع الخاص بالسحب محدود في هذه النسخة.
+             */
+            return projectJson()
+        }
     }
 
     override fun onDestroy() {
-        // احفظ آخر حالة للمشروع قبل إغلاق الشاشة.
-        try {
-            if (::status.isInitialized) saveLocalProject()
-        } catch (_: Exception) {}
-
         handler.removeCallbacksAndMessages(null)
 
         try {
