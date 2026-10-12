@@ -1120,18 +1120,23 @@ class MainActivity : ComponentActivity() {
                 paint.color = clip.color
 
                 canvas.drawRoundRect(
-                    x1, top.toFloat(),
-                    max(x1 + dp(10f), x2), bottom.toFloat(),
-                    dp(7f).toFloat(), dp(7f).toFloat(), paint
+                    x1,
+                    top.toFloat(),
+                    max(x1 + dp(10f), x2),
+                    bottom.toFloat(),
+                    dp(7f).toFloat(),
+                    dp(7f).toFloat(),
+                    paint
                 )
 
                 paint.color = WHITE
                 paint.textSize = dp(11f).toFloat()
 
+                // ✅ الإصلاح: تحويل top + dp(14f) إلى Float
                 canvas.drawText(
                     clip.name.take(20),
                     x1 + dp(6f),
-                    top + dp(14f),
+                    (top + dp(14f)).toFloat(),
                     paint
                 )
 
@@ -1305,9 +1310,10 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // ✅ الإصلاح: توقيع الدالة Array<String> بدل Array<out String>
     override fun onRequestPermissionsResult(
         requestCode: Int,
-        permissions: Array<out String>,
+        permissions: Array<String>,
         grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
