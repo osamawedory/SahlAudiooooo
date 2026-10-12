@@ -240,7 +240,6 @@ class MainActivity : ComponentActivity() {
             isFillViewport = false
             addView(
                 horizontal,
-                // ✅ الإصلاح: FrameLayout.LayoutParams بدل ScrollView.LayoutParams
                 FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT
@@ -248,7 +247,8 @@ class MainActivity : ComponentActivity() {
             )
         }
 
-        root.addView(vertical, LinearLayout.LayoutParams(0, 0, 1f))
+        // ✅ الإصلاح الرئيسي: العرض = MATCH_PARENT (-1) بدل 0
+        root.addView(vertical, LinearLayout.LayoutParams(-1, 0, 1f))
 
         val editRow = makeRow()
         editRow.addView(makeButton("قص البداية") { trimStartAtPlayhead() })
@@ -529,7 +529,6 @@ class MainActivity : ComponentActivity() {
         val input = EditText(this).apply {
             setText(clip.name)
             setSelection(text.length)
-            // ✅ الإصلاح: بدل singleLine = true
             maxLines = 1
             inputType = InputType.TYPE_CLASS_TEXT
         }
