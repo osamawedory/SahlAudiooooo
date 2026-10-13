@@ -1066,7 +1066,7 @@ class MainActivity : ComponentActivity() {
             }.show()
         }
         box.addView(addPause)
-        val editPauses = makeButton("تعديل أرقام الآيات") { editPauseNumbers(refreshLabels) }
+        val editPauses = makeButton("تعديل أرقام الآيات") { editPauseNumbers { refreshLabels() } }
         box.addView(editPauses)
         val folder = makeButton(if (splitConfig.outputTreeUri == null) "اختيار مجلد الإخراج" else "تغيير مجلد الإخراج") {
             pendingSplitFolder = true
