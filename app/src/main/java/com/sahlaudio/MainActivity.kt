@@ -1060,7 +1060,7 @@ class MainActivity : ComponentActivity() {
             AlertDialog.Builder(this).setTitle("رقم الآية لهذه الوقفة").setView(input).setNegativeButton("إلغاء", null).setPositiveButton("حفظ") { _, _ ->
                 val segment = splitConfig.mainMarkersMs.sorted().indexOfFirst { playheadMs < it } + 1
                 val seg = segment.coerceAtLeast(1)
-                val start = splitConfig.mainMarkersMs.sorted().getOrNull(seg-1)?.let { if (playheadMs >= it) it else 0L } ?: 0L
+                val start = splitConfig.mainMarkersMs.sorted().getOrNull(seg - 2) ?: 0L
                 splitConfig.pauses.add(SplitPause(seg, input.text.toString().toIntOrNull()?.coerceAtLeast(1) ?: 1, (playheadMs-start).coerceAtLeast(0L)))
                 refreshLabels(); saveLocalProject()
             }.show()
