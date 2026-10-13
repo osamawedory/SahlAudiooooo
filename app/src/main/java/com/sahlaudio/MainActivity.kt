@@ -32,6 +32,14 @@ import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
+import android.widget.ProgressBar
+import android.widget.CheckBox
+import androidx.documentfile.provider.DocumentFile
+import com.github.pao11.libffmpeg.FFmpeg
+import com.github.pao11.libffmpeg.ExecuteBinaryResponseHandler
+import com.github.pao11.libffmpeg.LoadBinaryResponseHandler
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.CountDownLatch
 import androidx.activity.ComponentActivity
 import androidx.core.content.ContextCompat
 import org.json.JSONArray
@@ -51,7 +59,14 @@ private const val REQUEST_AUDIO = 1001
 private const val REQUEST_IMPORT_PROJECT = 1002
 private const val REQUEST_EXPORT_PROJECT = 1003
 private const val REQUEST_MICROPHONE = 1004
+private const val REQUEST_SPLIT_FOLDER = 1005
 
+data class SplitPause(var segment: Int, var ayah: Int, var offsetMs: Long)
+data class SplitConfig(
+    val mainMarkersMs: MutableList<Long> = mutableListOf(),
+    val pauses: MutableList<SplitPause> = mutableListOf(),
+    var outputTreeUri: String? = null
+)
 data class AudioClip(
     val id: Long,
     val uri: String,
@@ -92,6 +107,10 @@ class MainActivity : ComponentActivity() {
     private var recordingStartedAt = 0L
     private var isPlaying = false
     private var isRecording = false
+    private val splitConfig = SplitConfig()
+    private var splitProgressDialog: AlertDialog? = null
+    private var splitCancel = AtomicBoolean(false)
+    private var pendingSplitFolder = false
 
     private val handler = Handler(Looper.getMainLooper())
     private val undoStack = java.util.ArrayDeque<String>()
@@ -171,6 +190,7 @@ class MainActivity : ComponentActivity() {
         row1.addView(makeButton("＋ إضافة صوت") { chooseAudio() })
         row1.addView(makeButton("▶ تشغيل") { togglePlayback() })
         row1.addView(makeButton("■ إيقاف") { stopPlayback() })
+        row1.addView(makeButton("تقسيم التسجيلات") { showSplitRecordingsMode() })
         root.addView(row1)
 
         val row2 = makeRow()
@@ -387,6 +407,10 @@ class MainActivity : ComponentActivity() {
         if (resultCode != Activity.RESULT_OK) return
         val uri = data?.data ?: return
 
+        if (requestCode == REQUEST_SPLIT_FOLDER) {
+            try { contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION) } catch (_: Exception) {}
+            splitConfig.outputTreeUri = uri.toString(); saveLocalProject(); showStatus("تم اختيار مجلد الإخراج"); return
+        }
         when (requestCode) {
             REQUEST_AUDIO -> {
                 try {
@@ -924,6 +948,13 @@ class MainActivity : ComponentActivity() {
         }
 
         obj.put("clips", array)
+        obj.put("splitMainMarkersMs", JSONArray(splitConfig.mainMarkersMs))
+        val pauses = JSONArray()
+        splitConfig.pauses.forEach { p -> pauses.put(JSONObject().apply {
+            put("segment", p.segment); put("ayah", p.ayah); put("offsetMs", p.offsetMs)
+        }) }
+        obj.put("splitPauses", pauses)
+        obj.put("splitOutputTreeUri", splitConfig.outputTreeUri)
         return obj.toString()
     }
 
@@ -976,6 +1007,18 @@ class MainActivity : ComponentActivity() {
                 .toFloat().coerceIn(8f, 240f)
 
             selectedId = clips.firstOrNull()?.id
+            splitConfig.mainMarkersMs.clear()
+            val markers = obj.optJSONArray("splitMainMarkersMs")
+            if (markers != null) for (i in 0 until markers.length()) {
+                splitConfig.mainMarkersMs.add(markers.optLong(i).coerceAtLeast(0L))
+            }
+            splitConfig.pauses.clear()
+            val pauses = obj.optJSONArray("splitPauses")
+            if (pauses != null) for (i in 0 until pauses.length()) {
+                val q = pauses.optJSONObject(i) ?: continue
+                splitConfig.pauses.add(SplitPause(q.optInt("segment", 1), q.optInt("ayah", 1), q.optLong("offsetMs", 0L).coerceAtLeast(0L)))
+            }
+            splitConfig.outputTreeUri = obj.optString("splitOutputTreeUri", null)
             refreshTimeline()
         } catch (e: Exception) {
             showStatus("ملف المشروع غير صالح: ${e.message}")
@@ -993,6 +1036,123 @@ class MainActivity : ComponentActivity() {
         showStatus("تمت استعادة المشروع المحفوظ")
     }
 
+    private fun showSplitRecordingsMode() {
+        if (clips.isEmpty()) { showStatus("أضف التسجيلات أولًا"); return }
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(14f), dp(4f), dp(14f), dp(4f)); layoutDirection = View.LAYOUT_DIRECTION_RTL }
+        val info = makeLabel("وضع RTL: العلامات الرئيسية مشتركة بين كل التسجيلات. ضع المؤشر ثم أضف علامة.", 13f, MUTED)
+        box.addView(info)
+        val markerLabel = makeLabel("علامات التقسيم: ${splitConfig.mainMarkersMs.sorted().joinToString { formatTime(it) }}", 13f, GOLD)
+        box.addView(markerLabel)
+        val pauseLabel = makeLabel("علامات التوقف: ${splitConfig.pauses.size}", 13f, GOLD)
+        box.addView(pauseLabel)
+        fun refreshLabels() {
+            markerLabel.text = "علامات التقسيم: ${splitConfig.mainMarkersMs.sorted().joinToString { formatTime(it) }}"
+            pauseLabel.text = "علامات التوقف: ${splitConfig.pauses.size}"
+        }
+        val addMain = makeButton("إضافة علامة تقسيم عند المؤشر") {
+            val t = playheadMs.coerceAtLeast(0L)
+            if (t > 0 && splitConfig.mainMarkersMs.none { kotlin.math.abs(it-t) < 50 }) splitConfig.mainMarkersMs.add(t)
+            splitConfig.mainMarkersMs.sort(); refreshLabels(); saveLocalProject()
+        }
+        box.addView(addMain)
+        val addPause = makeButton("إضافة علامة توقف عند المؤشر") {
+            val input = EditText(this).apply { hint = "رقم الآية"; inputType = InputType.TYPE_CLASS_NUMBER; setText("1") }
+            AlertDialog.Builder(this).setTitle("رقم الآية لهذه الوقفة").setView(input).setNegativeButton("إلغاء", null).setPositiveButton("حفظ") { _, _ ->
+                val segment = splitConfig.mainMarkersMs.sorted().indexOfFirst { playheadMs < it } + 1
+                val seg = segment.coerceAtLeast(1)
+                val start = splitConfig.mainMarkersMs.sorted().getOrNull(seg-1)?.let { if (playheadMs >= it) it else 0L } ?: 0L
+                splitConfig.pauses.add(SplitPause(seg, input.text.toString().toIntOrNull()?.coerceAtLeast(1) ?: 1, (playheadMs-start).coerceAtLeast(0L)))
+                refreshLabels(); saveLocalProject()
+            }.show()
+        }
+        box.addView(addPause)
+        val editPauses = makeButton("تعديل أرقام الآيات") { editPauseNumbers(refreshLabels) }
+        box.addView(editPauses)
+        val folder = makeButton(if (splitConfig.outputTreeUri == null) "اختيار مجلد الإخراج" else "تغيير مجلد الإخراج") {
+            pendingSplitFolder = true
+            startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION), REQUEST_SPLIT_FOLDER)
+        }
+        box.addView(folder)
+        val export = makeButton("بدء التقسيم والتصدير") { if (splitConfig.outputTreeUri == null) showStatus("اختر مجلد الإخراج أولًا") else { (box.parent as? ViewGroup)?.let { } ; splitRecordings() } }
+        box.addView(export)
+        AlertDialog.Builder(this).setTitle("تقسيم التسجيلات").setView(box).setNegativeButton("إغلاق", null).show()
+    }
+    private fun editPauseNumbers(refresh: () -> Unit) {
+        if (splitConfig.pauses.isEmpty()) { showStatus("لا توجد علامات توقف"); return }
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(12f),0,dp(12f),0); layoutDirection=View.LAYOUT_DIRECTION_RTL }
+        val fields = splitConfig.pauses.mapIndexed { i, p -> EditText(this).apply { inputType=InputType.TYPE_CLASS_NUMBER; setText(p.ayah.toString()); hint="وقفة ${i+1} — الآية"; box.addView(this) } }
+        AlertDialog.Builder(this).setTitle("تحرير أرقام الآيات").setView(box).setNegativeButton("إلغاء", null).setPositiveButton("حفظ") { _, _ -> fields.forEachIndexed { i, f -> splitConfig.pauses[i].ayah=f.text.toString().toIntOrNull()?.coerceAtLeast(1) ?: splitConfig.pauses[i].ayah }; refresh(); saveLocalProject() }.show()
+    }
+    private fun splitRecordings() {
+        val tree = DocumentFile.fromTreeUri(this, Uri.parse(splitConfig.outputTreeUri)) ?: run { showStatus("مجلد الإخراج غير صالح"); return }
+        val boundaries = listOf(0L) + splitConfig.mainMarkersMs.distinct().sorted() + Long.MAX_VALUE
+        splitCancel = AtomicBoolean(false)
+        val progress = ProgressBar(this).apply { isIndeterminate=true }
+        splitProgressDialog = AlertDialog.Builder(this).setTitle("جارٍ التصدير").setMessage("تحضير التسجيلات…").setView(progress).setNegativeButton("إلغاء") { _, _ -> splitCancel.set(true) }.setOnDismissListener { splitCancel.set(true) }.create().also { it.show() }
+        Thread {
+            var completed=0; val total=(clips.size * (boundaries.size-1)).coerceAtLeast(1)
+            try {
+                clips.forEachIndexed { ri, clip ->
+                    if (splitCancel.get()) return@forEachIndexed
+                    val input = materializeInput(clip)
+                    val base = sanitizeFileName("تسجيل_${ri+1}")
+                    val dir = tree.findFile(base) ?: tree.createDirectory(base) ?: throw IllegalStateException("تعذر إنشاء مجلد $base")
+                    for (si in 0 until boundaries.size-1) {
+                        if (splitCancel.get()) break
+                        val start=boundaries[si].coerceAtMost(clip.lengthMs()); val end=boundaries[si+1].coerceAtMost(clip.lengthMs())
+                        if (end<=start) continue
+                        val outTemp=File(cacheDir, "split_${System.nanoTime()}.mp3")
+                        val seconds=((end-start).coerceAtLeast(1L))/1000.0
+                        val args=arrayOf("-y", "-ss", "${start/1000.0}", "-t", "$seconds", "-i", input.absolutePath, "-vn", "-acodec", "libmp3lame", "-q:a", "2", outTemp.absolutePath)
+                        if (!runFfmpeg(args) || !outTemp.exists() || outTemp.length()==0L) throw IllegalStateException("فشل ترميز المقطع ${si+1}")
+                        val file=dir.createFile("audio/mpeg", "${si+1}.mp3") ?: throw IllegalStateException("تعذر إنشاء ${si+1}.mp3")
+                        contentResolver.openOutputStream(file.uri)?.use { out -> outTemp.inputStream().use { it.copyTo(out) } }
+                        outTemp.delete(); completed++
+                        runOnUiThread { splitProgressDialog?.setMessage("${completed}/$total — التسجيل ${ri+1}") }
+                    }
+                }
+                val json=buildPauseJson()
+                val jf=tree.createFile("application/json", "pauses.json") ?: throw IllegalStateException("تعذر إنشاء pauses.json")
+                contentResolver.openOutputStream(jf.uri)?.bufferedWriter()?.use { it.write(json) }
+                runOnUiThread { splitProgressDialog?.dismiss(); showStatus("اكتمل تصدير التسجيلات وpauses.json") }
+            } catch (e: Exception) { runOnUiThread { splitProgressDialog?.dismiss(); showStatus("فشل التصدير: ${e.message}") } }
+        }.start()
+    }
+    private fun runFfmpeg(args: Array<String>): Boolean {
+        val loadLatch=CountDownLatch(1)
+        var loaded=false
+        try {
+            val ff=FFmpeg.getInstance(this)
+            ff.loadBinary(object: LoadBinaryResponseHandler() {
+                override fun onSuccess() { loaded=true }
+                override fun onFinish() { loadLatch.countDown() }
+                override fun onFailure() { loadLatch.countDown() }
+            })
+            loadLatch.await(90, java.util.concurrent.TimeUnit.SECONDS)
+            if (!loaded) return false
+            val done=CountDownLatch(1); var ok=false
+            ff.execute(args, object: ExecuteBinaryResponseHandler() {
+                override fun onSuccess(message: String?) { ok=true }
+                override fun onFailure(message: String?) { ok=false }
+                override fun onFinish() { done.countDown() }
+            })
+            done.await(10, java.util.concurrent.TimeUnit.MINUTES)
+            return ok
+        } catch (_: Exception) { return false }
+    }
+    private fun sanitizeFileName(s: String)=s.replace(Regex("[^\\p{L}\\p{N}._-]"), "_").take(60).ifBlank { "تسجيل" }
+    private fun materializeInput(clip: AudioClip): File {
+        val uri=Uri.parse(clip.uri); if (uri.scheme=="file") return File(uri.path!!)
+        val f=File(cacheDir, "input_${clip.id}.audio"); if (!f.exists()) contentResolver.openInputStream(uri)?.use { input -> f.outputStream().use { input.copyTo(it) } } ?: throw IllegalStateException("تعذر قراءة ${clip.name}"); return f
+    }
+    private fun buildPauseJson(): String {
+        val bySegment=JSONObject(); splitConfig.pauses.sortedWith(compareBy<SplitPause>{it.segment}.thenBy{it.offsetMs}).groupBy { it.segment }.forEach { (seg, list) ->
+            val arr=JSONArray(); var previous=0L
+            list.forEach { p -> val delta=(p.offsetMs-previous).coerceAtLeast(0L); arr.put(JSONObject().apply { put("ayah",p.ayah); put("pause", delta/1000.0) }); previous=p.offsetMs }
+            bySegment.put(seg.toString(), arr)
+        }
+        return JSONObject().apply { put("format", "sahl-audio-pauses-v1"); put("segments", bySegment) }.toString(2)
+    }
     private fun exportProject() {
         val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)

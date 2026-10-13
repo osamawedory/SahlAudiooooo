@@ -24,4 +24,6 @@ android {
 
 dependencies {
     implementation("androidx.activity:activity-ktx:1.10.1")
+    implementation("androidx.documentfile:documentfile:1.0.1")
+    implementation("io.github.pao11:ffmpeg-android:1.1.0")
 }
