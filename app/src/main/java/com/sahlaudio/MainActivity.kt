@@ -1939,7 +1939,7 @@ class MainActivity : ComponentActivity() {
                         // عند التصغير قد تصبح حافتا المقطع أقرب من مساحة اللمس
                         // القديمة (22dp)، فتُختار حافة خطأ ويبدو القص غير دقيق.
                         val clipPixelWidth = abs(timeToX(hit.endMs()) - timeToX(hit.startMs))
-                        val edgeHit = min(dp(22f), max(dp(5f), clipPixelWidth * 0.18f))
+                    val edgeHit = min(dp(22f).toFloat(), max(dp(5f).toFloat(), clipPixelWidth * 0.18f))
                         val nearLeft = abs(event.x - timeToX(hit.startMs)) < edgeHit
                         val nearRight = abs(event.x - timeToX(hit.endMs())) < edgeHit
                         dragMode = when {
