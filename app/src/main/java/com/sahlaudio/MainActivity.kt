@@ -112,7 +112,7 @@ class MainActivity : ComponentActivity() {
     private var playbackButton: Button? = null
     private var playbackClockStartedAt = 0L
     private var playbackClockPosition = 0L
-    private var playbackGeneration = 0L
+    @Volatile private var playbackGeneration = 0L
     private var lastExportedAudioUri: Uri? = null
     private var isRecording = false
     private var isDarkTheme = true
@@ -390,6 +390,7 @@ class MainActivity : ComponentActivity() {
         clips.firstOrNull { it.id == selectedId }
 
     private fun refreshTimeline() {
+        timeline.clampViewportIfIdle()
         timeline.invalidate()
 
         playLabel.text = "موضع التشغيل: ${formatTime(playheadMs)}"
@@ -790,10 +791,10 @@ class MainActivity : ComponentActivity() {
         private val clip: AudioClip,
         private val startOffsetMs: Long,
         private val generation: Long,
-        private val finished: () -> Unit
+        private val finished: (Boolean) -> Unit
     ) {
         @Volatile private var stopped = false
-        private var audioTrack: AudioTrack? = null
+        @Volatile private var audioTrack: AudioTrack? = null
         private var worker: Thread? = null
 
         fun start() {
@@ -809,6 +810,8 @@ class MainActivity : ComponentActivity() {
             val extractor = MediaExtractor()
             var codec: MediaCodec? = null
             var track: AudioTrack? = null
+            // يجب أن يكون خارج كتلة try حتى يمكن استعماله بأمان داخل finally.
+            var playbackFinishedNormally = false
             try {
                 val uri = Uri.parse(clip.uri)
                 if (uri.scheme == "file") extractor.setDataSource(uri.path ?: "")
@@ -844,7 +847,8 @@ class MainActivity : ComponentActivity() {
                         .build().apply { setVolume(clip.volume.coerceIn(0f, 1f)) }
                 }
                 val wantedStartUs = (clip.trimStartMs + startOffsetMs).coerceAtLeast(0L) * 1000L
-                val wantedEndUs = clip.trimEndMs * 1000L
+                val wantedEndUs = clip.trimEndMs.coerceAtLeast(0L) * 1000L
+                if (wantedStartUs >= wantedEndUs) return
                 extractor.seekTo(wantedStartUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
                 codec = MediaCodec.createDecoderByType(mime)
                 codec!!.configure(format, null, null, 0)
@@ -855,6 +859,7 @@ class MainActivity : ComponentActivity() {
                 // عدد الإطارات التي أُرسلت إلى AudioTrack؛ الكتابة تنتهي قبل أن
                 // يكون الصوت قد خرج فعليًا من المخزن إلى السماعة.
                 var totalFramesWritten = 0L
+                var producedAudio = false
                 while (!stopped && !outputDone) {
                     val c = codec ?: break
                     if (!inputDone) {
@@ -863,11 +868,18 @@ class MainActivity : ComponentActivity() {
                             val input = c.getInputBuffer(inputIndex)
                             if (input == null) continue
                             val size = extractor.readSampleData(input, 0)
-                            if (size < 0) {
-                                c.queueInputBuffer(inputIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            val sampleTimeUs = if (size >= 0) extractor.sampleTime else -1L
+
+                            // لا تفك بقية الملف بعد حد القص؛ أرسل نهاية التدفق عند
+                            // نهاية الجزء المطلوب بدل انتظار نهاية الملف الأصلي.
+                            if (size < 0 || sampleTimeUs >= wantedEndUs) {
+                                c.queueInputBuffer(
+                                    inputIndex, 0, 0, wantedEndUs,
+                                    MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                                )
                                 inputDone = true
                             } else {
-                                c.queueInputBuffer(inputIndex, 0, size, extractor.sampleTime, 0)
+                                c.queueInputBuffer(inputIndex, 0, size, sampleTimeUs, 0)
                                 extractor.advance()
                             }
                         }
@@ -892,14 +904,27 @@ class MainActivity : ComponentActivity() {
                         val buffer = c.getOutputBuffer(outputIndex)
                         if (buffer != null && info.size > 0 && info.presentationTimeUs < wantedEndUs) {
                             val bytesPerFrame = channels * 2
+                            val frameCount = info.size / bytesPerFrame
                             val bufferStartUs = info.presentationTimeUs
-                            val bufferEndUs = bufferStartUs + info.size.toLong() * 1_000_000L / (rate * bytesPerFrame)
-                            val skipFrames = if (bufferStartUs < wantedStartUs)
-                                ((wantedStartUs - bufferStartUs) * rate / 1_000_000L).toInt().coerceAtLeast(0) else 0
-                            val endFrames = if (bufferEndUs > wantedEndUs)
-                                ((wantedEndUs - bufferStartUs) * rate / 1_000_000L).toInt() else info.size / bytesPerFrame
-                            val startByte = (skipFrames * bytesPerFrame).coerceIn(0, info.size)
-                            val endByte = (endFrames * bytesPerFrame).coerceIn(startByte, info.size)
+                            val bufferEndUs = bufferStartUs +
+                                frameCount.toLong() * 1_000_000L / rate.coerceAtLeast(1)
+
+                            val firstFrame = if (bufferStartUs < wantedStartUs) {
+                                val deltaUs = wantedStartUs - bufferStartUs
+                                // قرّب البداية إلى الإطار التالي كيلا يتسرّب إطار سابق للقص.
+                                ((deltaUs * rate + 999_999L) / 1_000_000L)
+                                    .toInt().coerceIn(0, frameCount)
+                            } else {
+                                0
+                            }
+                            val lastFrame = if (bufferEndUs > wantedEndUs) {
+                                ((wantedEndUs - bufferStartUs) * rate / 1_000_000L)
+                                    .toInt().coerceIn(firstFrame, frameCount)
+                            } else {
+                                frameCount
+                            }
+                            val startByte = firstFrame * bytesPerFrame
+                            val endByte = lastFrame * bytesPerFrame
                             if (endByte > startByte) {
                                 val bytes = ByteArray(endByte - startByte)
                                 buffer.position(info.offset + startByte)
@@ -909,6 +934,7 @@ class MainActivity : ComponentActivity() {
                                     val n = track?.write(bytes, written, bytes.size - written, AudioTrack.WRITE_BLOCKING) ?: -1
                                     if (n <= 0) break
                                     written += n
+                                    producedAudio = true
                                     totalFramesWritten += n.toLong() / bytesPerFrame
                                 }
                             }
@@ -932,6 +958,7 @@ class MainActivity : ComponentActivity() {
                         try { Thread.sleep(5L) } catch (_: InterruptedException) { break }
                     }
                 }
+                playbackFinishedNormally = !stopped && outputDone && producedAudio
             } catch (_: Exception) {
                 // الملف قد يكون بصيغة لا يدعمها مفكك الهاتف؛ لا نكسر بقية المشروع.
             } finally {
@@ -941,7 +968,13 @@ class MainActivity : ComponentActivity() {
                 try { codec?.release() } catch (_: Exception) { }
                 extractor.release()
                 audioTrack = null
-                if (!stopped && generation == playbackGeneration) handler.post(finished)
+                if (!stopped && generation == playbackGeneration) {
+                    handler.post {
+                        if (!stopped && generation == playbackGeneration) {
+                            finished(playbackFinishedNormally)
+                        }
+                    }
+                }
             }
         }
     }
@@ -1025,6 +1058,7 @@ class MainActivity : ComponentActivity() {
         playbackClockPosition = playheadMs
         playbackClockStartedAt = System.currentTimeMillis()
         isPlaying = true
+        updatePlaybackButton()
         continuePlaybackFromCurrentPosition()
         showStatus(if (targets.size > 1) "▶ تشغيل ${targets.size} مقاطع معًا" else "▶ جارٍ التشغيل")
         handler.removeCallbacks(playbackTicker)
@@ -1034,13 +1068,30 @@ class MainActivity : ComponentActivity() {
     private fun playClip(clip: AudioClip) {
         if (!isPlaying || clip.endMs() <= playheadMs) return
         val offset = (playheadMs - clip.startMs).coerceAtLeast(0L)
-        val player = PreciseAudioPlayer(clip, offset, playbackGeneration) {
+        val player = PreciseAudioPlayer(clip, offset, playbackGeneration) { playedNormally ->
             players.remove(clip.id)
+            val playbackWasContinuing = isPlaying
+            // نمنع إعادة محاولة المقطع الفاشل بلا نهاية.
             completedClipIds.add(clip.id)
-            // لا نقفز بساعة الواجهة إلى نهاية المقطع: الساعة مستقلة عن سرعة
-            // فك الترميز، والقفز هنا كان يحرّك المؤشر فجأة وقد يتخطى مقاطع قصيرة.
+
             if (isPlaying && players.isEmpty() && scheduledStarts.isEmpty()) {
+                if (playedNormally) {
+                    val completedEnd = clips
+                        .filter { !it.muted && completedClipIds.contains(it.id) }
+                        .maxOfOrNull { it.endMs() }
+                    if (completedEnd != null && completedEnd > playheadMs) {
+                        playheadMs = completedEnd.coerceAtMost(projectEndMs())
+                        playbackClockPosition = playheadMs
+                        playbackClockStartedAt = System.currentTimeMillis()
+                        panToPlayheadIfNeeded()
+                        refreshTimeline()
+                    }
+                }
                 continuePlaybackFromCurrentPosition()
+            }
+            // أظهر الخطأ بعد استكمال انتقال حالة التشغيل حتى لا تستبدله refreshTimeline.
+            if (!playedNormally && playbackWasContinuing) {
+                showStatus("تعذر تشغيل المقطع: ${clip.name}")
             }
         }
         players[clip.id] = player
@@ -1089,14 +1140,23 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun releasePlayers() {
-        // إبطال كل callbacks المؤجلة حتى لا تعيد تشغيل نسخة قديمة من المقطع.
+        // احفظ المؤشر الزمني قبل إيقاف المشغلات عند القص أو التحريك أو التوقف المؤقت.
+        if (isPlaying) {
+            val elapsed = (System.currentTimeMillis() - playbackClockStartedAt).coerceAtLeast(0L)
+            playheadMs = (playbackClockPosition + elapsed).coerceIn(0L, projectEndMs())
+            playbackClockPosition = playheadMs
+            playbackClockStartedAt = System.currentTimeMillis()
+        }
+
+        // إبطال callbacks المؤجلة أولًا حتى لا تعيد تشغيل نسخة قديمة من المقطع.
         playbackGeneration += 1L
-        players.values.forEach { it.release() }
+        players.values.toList().forEach { it.release() }
         players.clear()
         scheduledStarts.clear()
         completedClipIds.clear()
         isPlaying = false
         handler.removeCallbacks(playbackTicker)
+        updatePlaybackButton()
     }
 
     private fun stopPlayback() {
@@ -1692,15 +1752,28 @@ class MainActivity : ComponentActivity() {
 
         fun keepPlayheadVisible() {
             val x = timeToX(playheadMs)
-            if (x < leftGutter + dp(12f)) panX = (panX - (leftGutter + dp(12f) - x)).coerceAtLeast(0f)
-            else if (x > width - dp(12f)) panX = (panX + (x - (width - dp(12f)))).coerceIn(0f, maxPanX())
+            if (x < leftGutter + dp(12f)) panX -= (leftGutter + dp(12f) - x)
+            else if (x > width - dp(12f)) panX += (x - (width - dp(12f)))
+            panX = panX.coerceIn(0f, maxPanX())
+            panY = panY.coerceIn(0f, maxPanY())
             invalidate()
         }
+
+        fun clampViewportIfIdle() {
+            // لا تغيّر التحويل الزمني أثناء سحب مقطع/حافة؛ وإلا يتحرك الموضع تحت الإصبع.
+            if (dragMode == "clip" || dragMode == "trimStart" ||
+                dragMode == "trimEnd" || dragMode == "pan" || dragMode == "pending") return
+            panX = panX.coerceIn(0f, maxPanX())
+            panY = panY.coerceIn(0f, maxPanY())
+        }
+
         fun zoomAroundPlayhead(factor: Float) {
             val oldScreenX = timeToX(playheadMs)
             zoom = (zoom * factor).coerceIn(0.005f, 5000f)
-            val newContentX = leftGutter + playheadMs / 1000f * zoom
+            val newContentX = (leftGutter.toDouble() +
+                playheadMs.toDouble() / 1000.0 * zoom.toDouble()).toFloat()
             panX = (newContentX - oldScreenX).coerceIn(0f, maxPanX())
+            panY = panY.coerceIn(0f, maxPanY())
             invalidate()
         }
 
@@ -1898,12 +1971,7 @@ class MainActivity : ComponentActivity() {
 
                     val px = timeToX(playheadMs)
 
-                    if (abs(event.x - px) < dp(18f)) {
-                        dragMode = "playhead"
-                        parent?.requestDisallowInterceptTouchEvent(true)
-                        return true
-                    }
-
+                    // المسطرة العلوية هي المنطقة المباشرة لتحريك المؤشر.
                     if (event.y < rulerHeight) {
                         dragMode = "playhead"
                         playheadMs = xToTime(event.x).coerceAtMost(projectEndMs())
@@ -1922,6 +1990,13 @@ class MainActivity : ComponentActivity() {
                             event.x <= timeToX(it.endMs()) + dp(4f)
                     }
 
+                    // لا تجعل خط المؤشر يخطف لمس حافة مقطع؛ استخدمه فقط عند الفراغ.
+                    if (hit == null && abs(event.x - px) < dp(18f)) {
+                        dragMode = "playhead"
+                        parent?.requestDisallowInterceptTouchEvent(true)
+                        return true
+                    }
+
                     if (hit == null) {
                         selectedId = null
                         // الضغطة في الفراغ تلغي التحديد؛ السحب من الفراغ يحرك اللوحة.
@@ -1932,16 +2007,25 @@ class MainActivity : ComponentActivity() {
                         selectedId = hit.id
                         dragMode = "none"
                     } else {
+                        // أوقف جلسة الصوت قبل تغيير توقيت مقطع مستخدم في تلك الجلسة.
+                        if (isPlaying) pausePlayback()
                         dragId = hit.id
                         originalStart = hit.startMs
                         originalTrimStart = hit.trimStartMs
                         originalTrimEnd = hit.trimEndMs
-                        // عند التصغير قد تصبح حافتا المقطع أقرب من مساحة اللمس
-                        // القديمة (22dp)، فتُختار حافة خطأ ويبدو القص غير دقيق.
-                        val clipPixelWidth = abs(timeToX(hit.endMs()) - timeToX(hit.startMs))
-                    val edgeHit = min(dp(22f).toFloat(), max(dp(5f).toFloat(), clipPixelWidth * 0.18f))
-                        val nearLeft = abs(event.x - timeToX(hit.startMs)) < edgeHit
-                        val nearRight = abs(event.x - timeToX(hit.endMs())) < edgeHit
+
+                        val leftX = timeToX(hit.startMs)
+                        val rightX = timeToX(hit.endMs())
+                        val clipPixelWidth = abs(rightX - leftX)
+                        val edgeHit = min(
+                            dp(22f).toFloat(),
+                            max(dp(5f).toFloat(), clipPixelWidth * 0.18f)
+                        )
+                        val distanceLeft = abs(event.x - leftX)
+                        val distanceRight = abs(event.x - rightX)
+                        // عند ضيق المقطع قد تتداخل منطقتا لمس الحافتين؛ اختر الأقرب.
+                        val nearLeft = distanceLeft < edgeHit && distanceLeft < distanceRight
+                        val nearRight = distanceRight < edgeHit && distanceRight < distanceLeft
                         dragMode = when {
                             nearLeft -> "trimStart"
                             nearRight -> "trimEnd"
@@ -2061,6 +2145,7 @@ class MainActivity : ComponentActivity() {
 
                     dragMode = "none"
                     parent?.requestDisallowInterceptTouchEvent(false)
+                    clampViewportIfIdle()
                     refreshTimeline()
                     return true
                 }
