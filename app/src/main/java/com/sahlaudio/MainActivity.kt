@@ -1,3 +1,4 @@
+
 package com.sahlaudio
 
 import android.Manifest
@@ -23,6 +24,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.OpenableColumns
 import android.provider.DocumentsContract
 import android.text.InputType
@@ -96,7 +98,7 @@ class MainActivity : ComponentActivity() {
 
     private val clips = mutableListOf<AudioClip>()
     private var tracks = 3
-    private var playheadMs = 0L
+    @Volatile private var playheadMs = 0L
     private var zoom = 70f
     private var selectedId: Long? = null
     private var projectName = "مشروعي الصوتي"
@@ -108,10 +110,13 @@ class MainActivity : ComponentActivity() {
     private var recorder: MediaRecorder? = null
     private var recordingFile: File? = null
     private var recordingStartedAt = 0L
-    private var isPlaying = false
+    @Volatile private var isPlaying = false
     private var playbackButton: Button? = null
-    private var playbackClockStartedAt = 0L
-    private var playbackClockPosition = 0L
+    @Volatile private var playbackClockStartedAt = 0L
+    @Volatile private var playbackClockPosition = 0L
+    @Volatile private var playbackClockAnchored = false
+    private val playbackClockLock = Any()
+    private val playerPrepareAheadMs = 700L
     @Volatile private var playbackGeneration = 0L
     private var lastExportedAudioUri: Uri? = null
     private var isRecording = false
@@ -327,7 +332,6 @@ class MainActivity : ComponentActivity() {
                         rememberUndo()
                     }
 
-                    override fun onStopTrackingTouch(seekBar: SeekBar?) {
                         saveLocalProject()
                     }
                 }
@@ -616,10 +620,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun renameSelected() {
-        val clip = selectedClip() ?: run {
-            showStatus("اختر مقطعًا أولًا")
-            return
-        }
+        val clip = selectedClip() ?: return
 
         val input = EditText(this).apply {
             setText(clip.name)
@@ -787,9 +788,57 @@ class MainActivity : ComponentActivity() {
     private fun updatePlaybackButton() {
         playbackButton?.text = if (isPlaying) "Ⅱ إيقاف مؤقت" else "▶ تشغيل"
     }
+    /** موضع النقل الحالي من ساعة monotonic واحدة مشتركة لجميع المقاطع. */
+    private fun currentPlaybackPositionMs(): Long {
+        if (!isPlaying || !playbackClockAnchored) return playheadMs.coerceAtLeast(0L)
+        val elapsed = (SystemClock.elapsedRealtime() - playbackClockStartedAt).coerceAtLeast(0L)
+        return (playbackClockPosition + elapsed).coerceAtLeast(0L)
+    }
+
+    private fun anchorPlaybackClockIfNeeded() {
+        synchronized(playbackClockLock) {
+            if (isPlaying && !playbackClockAnchored) {
+                playbackClockPosition = playheadMs.coerceAtLeast(0L)
+                playbackClockStartedAt = SystemClock.elapsedRealtime()
+                playbackClockAnchored = true
+            }
+        }
+    }
+
+    private fun startClockForInitialGapIfNeeded() {
+        val hasClipAtPlayhead = clips.any {
+            !it.muted && it.startMs <= playheadMs && it.endMs() > playheadMs
+        }
+        // إذا بدأ المستخدم في فجوة زمنية، فلا يوجد مشغّل يبدأ الساعة؛ شغّلها هنا.
+        if (!hasClipAtPlayhead) anchorPlaybackClockIfNeeded()
+    }
+
+    private fun awaitPlaybackTimelinePosition(targetMs: Long, generation: Long): Boolean {
+        while (true) {
+            if (!isPlaying || generation != playbackGeneration) return false
+            if (!playbackClockAnchored) {
+                // أول مقطع حاضر عند المؤشر هو الذي يبدأ الساعة؛ لا تبدأها مشغلات المستقبل مبكرًا.
+                if (targetMs <= playheadMs) anchorPlaybackClockIfNeeded()
+                else {
+                    try { Thread.sleep(5L) } catch (_: InterruptedException) {
+                        if (!isPlaying || generation != playbackGeneration) return false
+                    }
+                    continue
+                }
+            }
+            val leftMs = targetMs - currentPlaybackPositionMs()
+            if (leftMs <= 0L) return true
+            try { Thread.sleep(leftMs.coerceAtMost(5L).coerceAtLeast(1L)) }
+            catch (_: InterruptedException) {
+                if (!isPlaying || generation != playbackGeneration) return false
+            }
+        }
+    }
+
     private inner class PreciseAudioPlayer(
         private val clip: AudioClip,
         private val startOffsetMs: Long,
+        private val targetTimelineMs: Long,
         private val generation: Long,
         private val finished: (Boolean) -> Unit
     ) {
@@ -846,7 +895,7 @@ class MainActivity : ComponentActivity() {
                         .setTransferMode(AudioTrack.MODE_STREAM)
                         .build().apply { setVolume(clip.volume.coerceIn(0f, 1f)) }
                 }
-                val wantedStartUs = (clip.trimStartMs + startOffsetMs).coerceAtLeast(0L) * 1000L
+                var wantedStartUs = (clip.trimStartMs + startOffsetMs).coerceAtLeast(0L) * 1000L
                 val wantedEndUs = clip.trimEndMs.coerceAtLeast(0L) * 1000L
                 if (wantedStartUs >= wantedEndUs) return
                 extractor.seekTo(wantedStartUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
@@ -856,11 +905,25 @@ class MainActivity : ComponentActivity() {
                 val info = MediaCodec.BufferInfo()
                 var inputDone = false
                 var outputDone = false
-                // عدد الإطارات التي أُرسلت إلى AudioTrack؛ الكتابة تنتهي قبل أن
-                // يكون الصوت قد خرج فعليًا من المخزن إلى السماعة.
-                var totalFramesWritten = 0L
+                var trackStarted = false
+                // احسب البايتات كلها قبل تحويلها إلى إطارات؛ قد يعيد AudioTrack كتابة جزئية.
+                var totalBytesWritten = 0L
                 var producedAudio = false
-                while (!stopped && !outputDone) {
+
+                fun startTrackWhenDue(): Boolean {
+                    val activeTrack = track ?: return false
+                    if (trackStarted) return true
+                    if (!awaitPlaybackTimelinePosition(targetTimelineMs, generation)) return false
+                    val actualPositionMs = currentPlaybackPositionMs()
+                    val lateByMs = (actualPositionMs - targetTimelineMs).coerceAtLeast(0L)
+                    wantedStartUs = (wantedStartUs + lateByMs * 1000L).coerceAtMost(wantedEndUs)
+                    if (wantedStartUs >= wantedEndUs) return false
+                    activeTrack.play()
+                    trackStarted = true
+                    return true
+                }
+
+                while (!stopped && generation == playbackGeneration && !outputDone) {
                     val c = codec ?: break
                     if (!inputDone) {
                         val inputIndex = c.dequeueInputBuffer(10_000)
@@ -892,14 +955,16 @@ class MainActivity : ComponentActivity() {
                         try { track?.release() } catch (_: Exception) { }
                         track = createTrack(rate, channels)
                         audioTrack = track
-                        track?.play()
                         continue
                     }
                     if (outputIndex >= 0) {
                         if (track == null) {
                             track = createTrack(rate, channels)
                             audioTrack = track
-                            track?.play()
+                        }
+                        if (!trackStarted && !startTrackWhenDue()) {
+                            c.releaseOutputBuffer(outputIndex, false)
+                            break
                         }
                         val buffer = c.getOutputBuffer(outputIndex)
                         if (buffer != null && info.size > 0 && info.presentationTimeUs < wantedEndUs) {
@@ -910,6 +975,240 @@ class MainActivity : ComponentActivity() {
                                 frameCount.toLong() * 1_000_000L / rate.coerceAtLeast(1)
 
                             val firstFrame = if (bufferStartUs < wantedStartUs) {
+
+    private fun shareLastExportedAudio() {
+        val uri = lastExportedAudioUri
+        if (uri == null) { showStatus("صدّر ملفًا صوتيًا أولًا"); return }
+        try {
+            val intent = Intent(Intent.ACTION_SEND).apply {
+                type = "audio/wav"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(intent, "مشاركة الملف الصوتي"))
+        } catch (e: Exception) {
+            showStatus("تعذرت مشاركة الملف: ${e.message}")
+        }
+    }
+
+    private data class DecodedPcm(
+        val samples: ShortArray,
+        val sampleRate: Int,
+        val channels: Int
+    )
+
+    private fun decodePcm(uri: Uri): DecodedPcm {
+        val extractor = MediaExtractor()
+        var codec: MediaCodec? = null
+        val output = ByteArrayOutputStream()
+        var sampleRate = 44100
+        var channels = 2
+
+        try {
+            if (uri.scheme == "file") extractor.setDataSource(uri.path ?: "")
+            else extractor.setDataSource(this, uri, null)
+            var audioTrackIndex = -1
+            for (i in 0 until extractor.trackCount) {
+                val format = extractor.getTrackFormat(i)
+                if (format.getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true) {
+                    audioTrackIndex = i
+                    break
+                }
+            }
+            if (audioTrackIndex < 0) throw IllegalArgumentException("لا يوجد مسار صوتي")
+            extractor.selectTrack(audioTrackIndex)
+            val format = extractor.getTrackFormat(audioTrackIndex)
+            sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+            channels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT).coerceIn(1, 2)
+            codec = MediaCodec.createDecoderByType(format.getString(MediaFormat.KEY_MIME)!!)
+            codec!!.configure(format, null, null, 0)
+            codec!!.start()
+            val info = MediaCodec.BufferInfo()
+            var inputDone = false
+            var outputDone = false
+            while (!outputDone) {
+                if (!inputDone) {
+                    val inputIndex = codec!!.dequeueInputBuffer(10_000)
+                    if (inputIndex >= 0) {
+                        val input = codec!!.getInputBuffer(inputIndex)
+                        if (input == null) continue
+                        val size = extractor.readSampleData(input, 0)
+                        if (size < 0) {
+                            codec!!.queueInputBuffer(inputIndex, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            inputDone = true
+                        } else {
+                            codec!!.queueInputBuffer(inputIndex, 0, size, extractor.sampleTime, 0)
+                            extractor.advance()
+                        }
+                    }
+                }
+                val outputIndex = codec!!.dequeueOutputBuffer(info, 10_000)
+                if (outputIndex >= 0) {
+                    val buffer = codec!!.getOutputBuffer(outputIndex)
+                    if (buffer != null && info.size > 0) {
+                        val bytes = ByteArray(info.size)
+                        buffer.position(info.offset)
+                        buffer.get(bytes)
+                        output.write(bytes)
+                    }
+                    codec!!.releaseOutputBuffer(outputIndex, false)
+                    if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) outputDone = true
+                }
+            }
+        } finally {
+            try { codec?.stop() } catch (_: Exception) { }
+            try { codec?.release() } catch (_: Exception) { }
+            extractor.release()
+        }
+
+        val bytes = output.toByteArray()
+        val shortBuffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+        val samples = ShortArray(shortBuffer.remaining())
+        shortBuffer.get(samples)
+        return DecodedPcm(samples, sampleRate, channels)
+    }
+
+    private fun exportFinalAudio(uri: Uri) {
+        val snapshot = clips.filter { !it.muted && it.lengthMs() > 0L }.map { it.copy() }
+        if (snapshot.isEmpty()) { showStatus("لا يوجد صوت قابل للتصدير"); return }
+        showStatus("جارٍ تجهيز الصوت النهائي…")
+        Thread {
+            var success = false
+            var errorMessage: String? = null
+            try {
+                val decoded = snapshot.map { it to decodePcm(Uri.parse(it.uri)) }
+                val sampleRate = decoded.firstOrNull()?.second?.sampleRate ?: 44100
+                val outputChannels = 2
+                val totalFrames = (snapshot.maxOfOrNull { it.endMs() } ?: 0L)
+                    .coerceAtLeast(0L) * sampleRate / 1000L
+                if (totalFrames <= 0L || totalFrames > sampleRate.toLong() * 60L * 60L * 3L) {
+                    throw IllegalArgumentException("مدة المشروع غير صالحة أو تتجاوز 3 ساعات")
+                }
+                val output = ShortArray((totalFrames * outputChannels).toInt())
+                decoded.forEach { (clip, pcm) ->
+                    val clipStartFrame = clip.startMs * sampleRate / 1000L
+                    val sourceStartFrame = clip.trimStartMs * pcm.sampleRate / 1000L
+                    val sourceEndFrame = clip.trimEndMs * pcm.sampleRate / 1000L
+                    val usableFrames = (sourceEndFrame - sourceStartFrame).coerceAtLeast(0L)
+                    val outputFrames = clip.lengthMs() * sampleRate / 1000L
+                    val frames = min(usableFrames, outputFrames)
+                    var frame = 0L
+                    while (frame < frames) {
+                        val outFrame = clipStartFrame + frame
+                        if (outFrame >= totalFrames) break
+                        val sourceFrame = sourceStartFrame + frame * pcm.sampleRate / sampleRate
+                        if (sourceFrame >= sourceEndFrame) break
+                        val sourceIndex = (sourceFrame * pcm.channels).toInt()
+                        val left = pcm.samples.getOrElse(sourceIndex) { 0 }.toInt()
+                        val right = if (pcm.channels > 1) pcm.samples.getOrElse(sourceIndex + 1) { 0 }.toInt() else left
+                        val outIndex = (outFrame * outputChannels).toInt()
+                        val gain = clip.volume.coerceIn(0f, 1f)
+                        output[outIndex] = (output[outIndex].toInt() + (left * gain).toInt()).coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+                        output[outIndex + 1] = (output[outIndex + 1].toInt() + (right * gain).toInt()).coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+                        frame++
+                    }
+                }
+                contentResolver.openOutputStream(uri, "wt")?.use { stream ->
+                    val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
+                    val dataSize = output.size * 2
+                    header.put("RIFF".toByteArray(Charsets.US_ASCII))
+                    header.putInt(36 + dataSize)
+                    header.put("WAVE".toByteArray(Charsets.US_ASCII))
+                    header.put("fmt ".toByteArray(Charsets.US_ASCII))
+                    header.putInt(16); header.putShort(1.toShort()); header.putShort(outputChannels.toShort())
+                    header.putInt(sampleRate); header.putInt(sampleRate * outputChannels * 2)
+                    header.putShort((outputChannels * 2).toShort()); header.putShort(16.toShort())
+                    header.put("data".toByteArray(Charsets.US_ASCII)); header.putInt(dataSize)
+                    stream.write(header.array())
+                    val bytes = ByteBuffer.allocate(output.size * 2).order(ByteOrder.LITTLE_ENDIAN)
+                    output.forEach { bytes.putShort(it) }
+                    stream.write(bytes.array())
+                } ?: throw IllegalStateException("تعذر فتح ملف الحفظ")
+                success = true
+            } catch (e: Exception) {
+                errorMessage = e.message ?: "خطأ غير معروف"
+            }
+            handler.post {
+                if (success) {
+                    lastExportedAudioUri = uri
+                    showStatus("تم تصدير الملف الصوتي النهائي")
+                } else {
+                    showStatus("فشل التصدير: $errorMessage")
+                }
+            }
+        }.start()
+    }
+
+    private fun importProject() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "application/json"
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        startActivityForResult(intent, REQUEST_IMPORT_PROJECT)
+    }
+
+    private fun exportProject() {
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "application/json"
+            putExtra(Intent.EXTRA_TITLE, "${projectName}.json")
+        }
+        startActivityForResult(intent, REQUEST_EXPORT_PROJECT)
+    }
+
+    private fun copyProjectJson(): String = projectJson()
+
+    private fun deleteProject(name: String) {
+        val projects = JSONObject(prefs.getString("projects", "{}") ?: "{}")
+        projects.remove(name)
+        prefs.edit().putString("projects", projects.toString()).apply()
+    }
+
+    private fun refreshAfterProjectChange() {
+        refreshTimeline()
+        saveLocalProject()
+    }
+
+    private fun chooseProjectToDelete() {
+        val projects = JSONObject(prefs.getString("projects", "{}") ?: "{}")
+        val names = mutableListOf<String>()
+        val keys = projects.keys()
+        while (keys.hasNext()) names.add(keys.next())
+        if (names.isEmpty()) {
+            showStatus("لا توجد مشاريع لحذفها")
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("اختر مشروعًا لحذفه")
+            .setItems(names.toTypedArray()) { _, which ->
+                val name = names[which]
+                AlertDialog.Builder(this)
+                    .setTitle("حذف $name")
+                    .setMessage("هل تريد حذف هذا المشروع؟")
+                    .setNegativeButton("إلغاء", null)
+                    .setPositiveButton("حذف") { _, _ ->
+                        deleteProject(name)
+                        if (name == projectName) newProject()
+                        else showStatus("تم حذف المشروع")
+                    }.show()
+            }.setNegativeButton("إلغاء", null).show()
+    }
+
+    private fun handleProjectMenu() {
+        val options = arrayOf("فتح مشروع", "إنشاء مشروع", "إعادة تسمية", "حذف مشروع")
+        AlertDialog.Builder(this)
+            .setTitle("إدارة المشاريع")
+            .setItems(options) { _, which ->
+                when (which) {
+                    0 -> showProjects()
+                    1 -> newProject()
+                    2 -> renameProject()
+                    3 -> chooseProjectToDelete()
+                }
+            }.show()
+    }
+
                                 val deltaUs = wantedStartUs - bufferStartUs
                                 // قرّب البداية إلى الإطار التالي كيلا يتسرّب إطار سابق للقص.
                                 ((deltaUs * rate + 999_999L) / 1_000_000L)
@@ -930,12 +1229,12 @@ class MainActivity : ComponentActivity() {
                                 buffer.position(info.offset + startByte)
                                 buffer.get(bytes)
                                 var written = 0
-                                while (!stopped && written < bytes.size) {
+                                while (!stopped && generation == playbackGeneration && written < bytes.size) {
                                     val n = track?.write(bytes, written, bytes.size - written, AudioTrack.WRITE_BLOCKING) ?: -1
                                     if (n <= 0) break
                                     written += n
                                     producedAudio = true
-                                    totalFramesWritten += n.toLong() / bytesPerFrame
+                                    totalBytesWritten += n.toLong()
                                 }
                             }
                         }
@@ -948,17 +1247,21 @@ class MainActivity : ComponentActivity() {
                 // الإطارات المرسلة من مخزن AudioTrack حتى لا يبدأ الجزء التالي
                 // فوق آخر مقطع مسموع، وهو ما قد يكرر مقطعًا صوتيًا قصيرًا.
                 val completedTrack = track
-                if (!stopped && outputDone && completedTrack != null) {
-                    val drainDeadline = System.currentTimeMillis() +
+                val totalFramesWritten = totalBytesWritten / (channels * 2).coerceAtLeast(1)
+                if (!stopped && generation == playbackGeneration && outputDone && completedTrack != null && trackStarted) {
+                    val drainDeadline = SystemClock.elapsedRealtime() +
                         (totalFramesWritten * 1000L / rate).coerceAtLeast(250L) + 1500L
-                    while (!stopped &&
+                    while (!stopped && generation == playbackGeneration &&
                         completedTrack.playbackHeadPosition.toLong() < totalFramesWritten &&
-                        System.currentTimeMillis() < drainDeadline
+                        SystemClock.elapsedRealtime() < drainDeadline
                     ) {
-                        try { Thread.sleep(5L) } catch (_: InterruptedException) { break }
+                        try { Thread.sleep(5L) } catch (_: InterruptedException) {
+                            if (stopped || generation != playbackGeneration) break
+                        }
                     }
                 }
-                playbackFinishedNormally = !stopped && outputDone && producedAudio
+                playbackFinishedNormally = !stopped && generation == playbackGeneration &&
+                    outputDone && producedAudio && trackStarted
             } catch (_: Exception) {
                 // الملف قد يكون بصيغة لا يدعمها مفكك الهاتف؛ لا نكسر بقية المشروع.
             } finally {
@@ -966,7 +1269,7 @@ class MainActivity : ComponentActivity() {
                 try { track?.release() } catch (_: Exception) { }
                 try { codec?.stop() } catch (_: Exception) { }
                 try { codec?.release() } catch (_: Exception) { }
-                extractor.release()
+                try { extractor.release() } catch (_: Exception) { }
                 audioTrack = null
                 if (!stopped && generation == playbackGeneration) {
                     handler.post {
@@ -989,75 +1292,92 @@ class MainActivity : ComponentActivity() {
     }
     private fun continuePlaybackFromCurrentPosition() {
         if (!isPlaying) return
+        if (players.isNotEmpty() || scheduledStarts.isNotEmpty()) return
+
+        val positionNow = currentPlaybackPositionMs()
         val remaining = clips.filter {
-            !it.muted && it.endMs() > playheadMs &&
+            !it.muted && it.endMs() > positionNow &&
                 !completedClipIds.contains(it.id) &&
                 !players.containsKey(it.id) && !scheduledStarts.contains(it.id)
         }
         if (remaining.isEmpty()) {
             isPlaying = false
+            playbackClockAnchored = false
             updatePlaybackButton()
             handler.removeCallbacks(playbackTicker)
             refreshTimeline()
             return
         }
+
         val generation = playbackGeneration
         remaining.forEach { clip ->
-            val delay = (clip.startMs - playheadMs).coerceAtLeast(0L)
-            if (delay == 0L) playClip(clip) else {
+            // ابدأ تجهيز فك الترميز قبل موعد المقطع، لكن لا يبدأ الصوت حتى يحين موعده.
+            val delay = (clip.startMs - positionNow - playerPrepareAheadMs).coerceAtLeast(0L)
+            if (delay == 0L) {
+                playClip(clip)
+            } else {
                 scheduledStarts.add(clip.id)
                 handler.postDelayed({
-                    // تجاهل أي أمر مؤجل من جلسة تشغيل قديمة بعد القص أو التحريك.
                     if (generation != playbackGeneration) return@postDelayed
                     scheduledStarts.remove(clip.id)
-                    if (isPlaying && !completedClipIds.contains(clip.id) && clip.endMs() > playheadMs) {
+                    if (isPlaying && !completedClipIds.contains(clip.id) &&
+                        clip.endMs() > currentPlaybackPositionMs()
+                    ) {
                         playClip(clip)
+                    }
+                    if (isPlaying && players.isEmpty() && scheduledStarts.isEmpty()) {
+                        continuePlaybackFromCurrentPosition()
                     }
                 }, delay)
             }
         }
     }
+
     private fun seekPlaybackTo(positionMs: Long) {
         if (!isPlaying) {
             playheadMs = positionMs.coerceIn(0L, projectEndMs())
             refreshTimeline()
             return
         }
+
         releasePlayers()
-        completedClipIds.clear()
         playheadMs = positionMs.coerceIn(0L, projectEndMs())
         playbackClockPosition = playheadMs
-        playbackClockStartedAt = System.currentTimeMillis()
+        playbackClockStartedAt = 0L
+        playbackClockAnchored = false
         isPlaying = true
+        startClockForInitialGapIfNeeded()
         updatePlaybackButton()
         continuePlaybackFromCurrentPosition()
         handler.removeCallbacks(playbackTicker)
         handler.post(playbackTicker)
     }
+
     private fun togglePlayback() {
         if (isPlaying) {
             pausePlayback()
             return
         }
 
-        // تشغيل جديد بعد الوصول للنهاية يبدأ من الصفر تلقائيًا.
         if (playheadMs >= projectEndMs()) {
             playheadMs = 0L
             panToPlayheadIfNeeded()
             refreshTimeline()
         }
-        val targets = clips.filter {
-            !it.muted && it.endMs() > playheadMs
-        }
+
+        val targets = clips.filter { !it.muted && it.endMs() > playheadMs }
         if (targets.isEmpty()) {
             showStatus("لا يوجد مقطع قابل للتشغيل عند هذا الموضع")
             return
         }
+
         releasePlayers()
         completedClipIds.clear()
         playbackClockPosition = playheadMs
-        playbackClockStartedAt = System.currentTimeMillis()
+        playbackClockStartedAt = 0L
+        playbackClockAnchored = false
         isPlaying = true
+        startClockForInitialGapIfNeeded()
         updatePlaybackButton()
         continuePlaybackFromCurrentPosition()
         showStatus(if (targets.size > 1) "▶ تشغيل ${targets.size} مقاطع معًا" else "▶ جارٍ التشغيل")
@@ -1066,31 +1386,27 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun playClip(clip: AudioClip) {
-        if (!isPlaying || clip.endMs() <= playheadMs) return
-        val offset = (playheadMs - clip.startMs).coerceAtLeast(0L)
-        val player = PreciseAudioPlayer(clip, offset, playbackGeneration) { playedNormally ->
+        if (!isPlaying) return
+        val now = currentPlaybackPositionMs()
+        if (clip.endMs() <= now) {
+            completedClipIds.add(clip.id)
+            return
+        }
+
+        val offset = (now - clip.startMs).coerceAtLeast(0L)
+        val targetTimelineMs = maxOf(now, clip.startMs)
+        val generation = playbackGeneration
+        val player = PreciseAudioPlayer(clip, offset, targetTimelineMs, generation) { playedNormally ->
+            if (generation != playbackGeneration) return@PreciseAudioPlayer
+            val wasPlaying = isPlaying
             players.remove(clip.id)
-            val playbackWasContinuing = isPlaying
-            // نمنع إعادة محاولة المقطع الفاشل بلا نهاية.
             completedClipIds.add(clip.id)
 
+            // لا تقفز إلى نهاية مقطع مكتمل؛ المؤشر يتبع ساعة النقل المشتركة وحدها.
             if (isPlaying && players.isEmpty() && scheduledStarts.isEmpty()) {
-                if (playedNormally) {
-                    val completedEnd = clips
-                        .filter { !it.muted && completedClipIds.contains(it.id) }
-                        .maxOfOrNull { it.endMs() }
-                    if (completedEnd != null && completedEnd > playheadMs) {
-                        playheadMs = completedEnd.coerceAtMost(projectEndMs())
-                        playbackClockPosition = playheadMs
-                        playbackClockStartedAt = System.currentTimeMillis()
-                        panToPlayheadIfNeeded()
-                        refreshTimeline()
-                    }
-                }
                 continuePlaybackFromCurrentPosition()
             }
-            // أظهر الخطأ بعد استكمال انتقال حالة التشغيل حتى لا تستبدله refreshTimeline.
-            if (!playedNormally && playbackWasContinuing) {
+            if (!playedNormally && wasPlaying) {
                 showStatus("تعذر تشغيل المقطع: ${clip.name}")
             }
         }
@@ -1102,37 +1418,39 @@ class MainActivity : ComponentActivity() {
         override fun run() {
             if (!isPlaying) return
             try {
-                val elapsed = (System.currentTimeMillis() - playbackClockStartedAt).coerceAtLeast(0L)
-                playheadMs = (playbackClockPosition + elapsed).coerceAtMost(projectEndMs())
+                if (playbackClockAnchored) {
+                    playheadMs = currentPlaybackPositionMs().coerceAtMost(projectEndMs())
+                }
+
                 if (playheadMs >= projectEndMs()) {
                     playheadMs = projectEndMs()
                     if (players.isEmpty() && scheduledStarts.isEmpty()) {
                         isPlaying = false
+                        playbackClockAnchored = false
                         updatePlaybackButton()
                         handler.removeCallbacks(this)
                     }
                     refreshTimeline()
-                    if (isPlaying) handler.postDelayed(this, 80L)
+                    if (isPlaying) handler.postDelayed(this, 60L)
                     return
                 }
+
                 if (players.isEmpty() && scheduledStarts.isEmpty()) {
                     continuePlaybackFromCurrentPosition()
                 }
                 panToPlayheadIfNeeded()
                 refreshTimeline()
             } catch (_: Exception) { }
-            if (isPlaying) handler.postDelayed(this, 80L)
+            if (isPlaying) handler.postDelayed(this, 60L)
         }
     }
+
     private fun pausePlayback() {
         if (isPlaying) {
-            val elapsed = (System.currentTimeMillis() - playbackClockStartedAt).coerceAtLeast(0L)
-            playheadMs = (playbackClockPosition + elapsed).coerceIn(0L, projectEndMs())
+            playheadMs = currentPlaybackPositionMs().coerceIn(0L, projectEndMs())
             playbackClockPosition = playheadMs
-            playbackClockStartedAt = System.currentTimeMillis()
+            playbackClockStartedAt = SystemClock.elapsedRealtime()
         }
-        // release بدل pause يمنع مخزن الصوت من إخراج جزء إضافي بعد الضغط.
-        // كما يلغي أي تشغيل مؤجل للمقطع التالي في اللحظة نفسها.
         releasePlayers()
         updatePlaybackButton()
         refreshTimeline()
@@ -1140,21 +1458,20 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun releasePlayers() {
-        // احفظ المؤشر الزمني قبل إيقاف المشغلات عند القص أو التحريك أو التوقف المؤقت.
         if (isPlaying) {
-            val elapsed = (System.currentTimeMillis() - playbackClockStartedAt).coerceAtLeast(0L)
-            playheadMs = (playbackClockPosition + elapsed).coerceIn(0L, projectEndMs())
+            playheadMs = currentPlaybackPositionMs().coerceIn(0L, projectEndMs())
             playbackClockPosition = playheadMs
-            playbackClockStartedAt = System.currentTimeMillis()
+            playbackClockStartedAt = SystemClock.elapsedRealtime()
         }
 
-        // إبطال callbacks المؤجلة أولًا حتى لا تعيد تشغيل نسخة قديمة من المقطع.
+        // أبطل الجيل الحالي قبل تحرير AudioTrack؛ callbacks القديمة لا يمكنها تعديل الجلسة الجديدة.
         playbackGeneration += 1L
         players.values.toList().forEach { it.release() }
         players.clear()
         scheduledStarts.clear()
         completedClipIds.clear()
         isPlaying = false
+        playbackClockAnchored = false
         handler.removeCallbacks(playbackTicker)
         updatePlaybackButton()
     }
@@ -1209,6 +1526,7 @@ class MainActivity : ComponentActivity() {
             newRecorder.setAudioSource(MediaRecorder.AudioSource.MIC)
             newRecorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
             newRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+
             newRecorder.setOutputFile(file.absolutePath)
             newRecorder.prepare()
             newRecorder.start()
@@ -1532,6 +1850,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun shareLastExportedAudio() {
+
         val uri = lastExportedAudioUri
         if (uri == null) {
             showStatus("صدّر ملف WAV أولًا ثم اضغط مشاركة")
@@ -1842,6 +2161,318 @@ class MainActivity : ComponentActivity() {
                 paint.color = if (track % 2 == 0) {
                     if (isDarkTheme) 0xFF17223A.toInt() else 0xFFFFEFE0.toInt()
                 } else {
+
+        val uri = lastExportedAudioUri
+        if (uri == null) {
+            showStatus("صدّر ملف WAV أولًا ثم اضغط مشاركة")
+            return
+        }
+        try {
+            val share = Intent(Intent.ACTION_SEND).apply {
+                type = "audio/wav"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(share, "مشاركة الصوت عبر…"))
+        } catch (e: Exception) {
+            showStatus("تعذرت مشاركة الصوت: ${e.message ?: "لا توجد تطبيقات مشاركة"}")
+        }
+    }
+
+    private data class DecodedPcm(val rate: Int, val channels: Int, val samples: ShortArray)
+    private fun sourceAudioFormat(uri: Uri): Pair<Int, Int> {
+        val extractor = MediaExtractor()
+        try {
+            if (uri.scheme == "file") extractor.setDataSource(uri.path ?: "")
+            else extractor.setDataSource(this, uri, null)
+            for (i in 0 until extractor.trackCount) {
+                val format = extractor.getTrackFormat(i)
+                if (format.getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true) {
+                    return format.getInteger(MediaFormat.KEY_SAMPLE_RATE) to
+                        format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                }
+            }
+        } finally {
+            extractor.release()
+        }
+        return 44100 to 2
+    }
+
+    private fun decodePcm(uri: Uri): DecodedPcm {
+        val extractor = MediaExtractor()
+        if (uri.scheme == "file") extractor.setDataSource(uri.path ?: "")
+        else extractor.setDataSource(this, uri, null)
+        var track = -1
+        for (i in 0 until extractor.trackCount) {
+            val f = extractor.getTrackFormat(i)
+            if (f.getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true) { track = i; break }
+        }
+        if (track < 0) throw IllegalArgumentException("لا يوجد مسار صوتي")
+        extractor.selectTrack(track)
+        val format = extractor.getTrackFormat(track)
+        val mime = format.getString(MediaFormat.KEY_MIME) ?: error("ترميز غير معروف")
+        val rate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+        val channels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+        val codec = MediaCodec.createDecoderByType(mime)
+        codec.configure(format, null, null, 0); codec.start()
+        val output = ByteArrayOutputStream()
+        val info = MediaCodec.BufferInfo()
+        var inputDone = false; var outputDone = false
+        try {
+            while (!outputDone) {
+                if (!inputDone) {
+                    val inputIndex = codec.dequeueInputBuffer(10_000)
+                    if (inputIndex >= 0) {
+                        val input = codec.getInputBuffer(inputIndex) ?: continue
+                        val size = extractor.readSampleData(input, 0)
+                        if (size < 0) {
+                            codec.queueInputBuffer(inputIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            inputDone = true
+                        } else {
+                            codec.queueInputBuffer(inputIndex, 0, size, extractor.sampleTime, 0)
+                            extractor.advance()
+                        }
+                    }
+                }
+                val outputIndex = codec.dequeueOutputBuffer(info, 10_000)
+                if (outputIndex >= 0) {
+                    val buffer = codec.getOutputBuffer(outputIndex)
+                    if (buffer != null && info.size > 0) {
+                        buffer.position(info.offset); buffer.limit(info.offset + info.size)
+                        val bytes = ByteArray(info.size); buffer.get(bytes); output.write(bytes)
+                    }
+                    codec.releaseOutputBuffer(outputIndex, false)
+                    if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) outputDone = true
+                }
+            }
+        } finally {
+            try { codec.stop() } catch (_: Exception) { }
+            codec.release(); extractor.release()
+        }
+        val raw = output.toByteArray()
+        val shorts = ShortArray(raw.size / 2)
+        ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(shorts)
+        return DecodedPcm(rate, channels, shorts)
+    }
+
+    private fun resample(pcm: DecodedPcm, targetRate: Int, targetChannels: Int): ShortArray {
+        if (pcm.rate == targetRate && pcm.channels == targetChannels) return pcm.samples
+        val frames = pcm.samples.size / pcm.channels
+        val targetFrames = (frames.toLong() * targetRate / pcm.rate).toInt().coerceAtLeast(1)
+        val result = ShortArray(targetFrames * targetChannels)
+        for (frame in 0 until targetFrames) {
+            val source = (frame.toDouble() * pcm.rate / targetRate).toInt().coerceIn(0, frames - 1)
+            for (ch in 0 until targetChannels) {
+                val sourceCh = if (pcm.channels == 1) 0 else ch.coerceAtMost(pcm.channels - 1)
+                result[frame * targetChannels + ch] = pcm.samples[source * pcm.channels + sourceCh]
+            }
+        }
+        return result
+    }
+
+    private fun writeWav(uri: Uri, mix: IntArray, rate: Int, channels: Int) {
+        contentResolver.openOutputStream(uri)?.use { stream ->
+            val dataSize = mix.size * 2
+            val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
+            header.put("RIFF".toByteArray()); header.putInt(36 + dataSize); header.put("WAVE".toByteArray())
+            header.put("fmt ".toByteArray()); header.putInt(16); header.putShort(1); header.putShort(channels.toShort())
+            header.putInt(rate); header.putInt(rate * channels * 2); header.putShort((channels * 2).toShort()); header.putShort(16)
+            header.put("data".toByteArray()); header.putInt(dataSize); stream.write(header.array())
+            val bytes = ByteBuffer.allocate(16 * 1024).order(ByteOrder.LITTLE_ENDIAN)
+            var index = 0
+            while (index < mix.size) {
+                bytes.clear(); val count = min(8 * 1024, mix.size - index)
+                repeat(count) { bytes.putShort(mix[index++].coerceIn(-32768, 32767).toShort()) }
+                stream.write(bytes.array(), 0, bytes.position())
+            }
+        } ?: error("تعذر فتح ملف التصدير")
+    }
+
+    private fun exportFinalAudio(uri: Uri) {
+        val snapshot = clips.map { it.copy() }
+        val snapshotEndMs = max(1_000L, snapshot.maxOfOrNull { it.endMs() } ?: 1_000L)
+        showStatus("جارٍ تجهيز المزيج النهائي…")
+        Thread {
+            try {
+                // استخدم صيغة أول مقطع فعلي بدل فرض 44.1 kHz وستيريو على كل الملفات.
+                // عند تطابق الصيغة لا تتم أي إعادة أخذ عينات إطلاقًا.
+                val reference = snapshot.firstOrNull { !it.muted && it.lengthMs() > 0L }
+                val (targetRate, targetChannels) = reference?.let {
+                    sourceAudioFormat(Uri.parse(it.uri))
+                } ?: (44100 to 2)
+                val totalFrames = (snapshotEndMs * targetRate / 1000L).toInt().coerceAtLeast(1)
+                val mix = IntArray(totalFrames * targetChannels)
+                snapshot.forEachIndexed { index, clip ->
+                    if (clip.muted || clip.lengthMs() <= 0L) return@forEachIndexed
+                    val pcm = resample(decodePcm(Uri.parse(clip.uri)), targetRate, targetChannels)
+                    val sourceStart = (clip.trimStartMs.toDouble() * targetRate / 1000).toInt().coerceAtLeast(0)
+                    val sourceFrames = (clip.lengthMs().toDouble() * targetRate / 1000).toInt()
+                    val destStart = (clip.startMs * targetRate / 1000L).toInt()
+                    val frames = min(sourceFrames, pcm.size / targetChannels - sourceStart)
+                    for (frame in 0 until frames) for (ch in 0 until targetChannels) {
+                        val dest = (destStart + frame) * targetChannels + ch
+                        if (dest in mix.indices) mix[dest] += (pcm[(sourceStart + frame) * targetChannels + ch] * clip.volume).toInt()
+                    }
+                    handler.post { status.text = "جاري مزج ${index + 1}/${snapshot.size}…" }
+                }
+                writeWav(uri, mix, targetRate, targetChannels)
+                handler.post {
+                    lastExportedAudioUri = uri
+                    showStatus("تم تصدير الصوت النهائي بنجاح؛ اضغط مشاركة لإرساله")
+                }
+            } catch (e: Exception) {
+                handler.post { showStatus("فشل التصدير: ${e.message ?: "صيغة غير مدعومة"}") }
+            }
+        }.start()
+    }
+
+    private fun exportProject() {
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "application/json"
+            putExtra(Intent.EXTRA_TITLE, "SahlAudio-project.json")
+        }
+
+        startActivityForResult(intent, REQUEST_EXPORT_PROJECT)
+    }
+
+    private fun importProject() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "application/json"
+        }
+
+        startActivityForResult(intent, REQUEST_IMPORT_PROJECT)
+    }
+
+    inner class TimelineView(context: Context) : View(context) {
+
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val trackHeight = dp(66f)
+        private val rulerHeight = dp(32f)
+        private val leftGutter = dp(72f)
+        private var panX = 0f
+        private var panY = 0f
+
+        private var downX = 0f
+        private var downY = 0f
+        private var lastX = 0f
+        private var lastY = 0f
+        private var dragMode = "none"
+        private var dragId: Long? = null
+        private var changed = false
+        private var beforeDrag = ""
+
+        private var originalStart = 0L
+        private var originalTrimStart = 0L
+        private var originalTrimEnd = 0L
+
+        private fun timeToX(ms: Long): Float =
+            (leftGutter.toDouble() + ms.toDouble() / 1000.0 * zoom.toDouble() - panX.toDouble()).toFloat()
+
+        private fun xToTime(x: Float): Long =
+            (((x.toDouble() + panX.toDouble() - leftGutter.toDouble()) /
+                zoom.toDouble()).coerceAtLeast(0.0) * 1000.0).roundToLong()
+
+        private fun maxPanX(): Float =
+            (leftGutter.toFloat() + projectEndMs() / 1000f * zoom + dp(100f) - width).coerceAtLeast(0f)
+
+        private fun maxPanY(): Float =
+            (rulerHeight + tracks * trackHeight - height).toFloat().coerceAtLeast(0f)
+
+        fun keepPlayheadVisible() {
+            val x = timeToX(playheadMs)
+            if (x < leftGutter + dp(12f)) panX -= (leftGutter + dp(12f) - x)
+            else if (x > width - dp(12f)) panX += (x - (width - dp(12f)))
+            panX = panX.coerceIn(0f, maxPanX())
+            panY = panY.coerceIn(0f, maxPanY())
+            invalidate()
+        }
+
+        fun clampViewportIfIdle() {
+            // لا تغيّر التحويل الزمني أثناء سحب مقطع/حافة؛ وإلا يتحرك الموضع تحت الإصبع.
+            if (dragMode == "clip" || dragMode == "trimStart" ||
+                dragMode == "trimEnd" || dragMode == "pan" || dragMode == "pending") return
+            panX = panX.coerceIn(0f, maxPanX())
+            panY = panY.coerceIn(0f, maxPanY())
+        }
+
+        fun zoomAroundPlayhead(factor: Float) {
+            val oldScreenX = timeToX(playheadMs)
+            zoom = (zoom * factor).coerceIn(0.005f, 5000f)
+            val newContentX = (leftGutter.toDouble() +
+                playheadMs.toDouble() / 1000.0 * zoom.toDouble()).toFloat()
+            panX = (newContentX - oldScreenX).coerceIn(0f, maxPanX())
+            panY = panY.coerceIn(0f, maxPanY())
+            invalidate()
+        }
+
+        private fun rulerStepMs(): Long {
+            val targetMs = (90000f / zoom).toLong().coerceAtLeast(1L)
+            var base = 1L
+            while (base * 10L <= targetMs) base *= 10L
+            for (multiplier in longArrayOf(1L, 2L, 5L, 10L)) {
+                val candidate = base * multiplier
+                if (candidate >= targetMs) return candidate
+            }
+            return base * 10L
+        }
+        private fun rulerLabel(ms: Long, step: Long): String {
+            val totalSeconds = ms / 1000L
+            val hours = totalSeconds / 3600L
+            val minutes = (totalSeconds / 60L) % 60L
+            val seconds = totalSeconds % 60L
+            return when {
+                hours > 0L || step >= 3_600_000L -> "%d:%02d:%02d".format(hours, minutes, seconds)
+                step >= 60_000L -> "%02d:%02d".format(totalSeconds / 60L, seconds)
+                step < 1_000L -> "${totalSeconds}.${(ms % 1000L) / 100L}"
+                else -> "%02d:%02d".format(totalSeconds / 60L, seconds)
+            }
+        }
+        override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+            setMeasuredDimension(MeasureSpec.getSize(widthMeasureSpec), MeasureSpec.getSize(heightMeasureSpec))
+        }
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            canvas.drawColor(BG)
+
+            paint.color = PANEL
+            canvas.drawRect(
+                0f, 0f, width.toFloat(), rulerHeight.toFloat(), paint
+            )
+
+            val end = projectEndMs()
+            val step = rulerStepMs()
+
+            var time = 0L
+
+            while (time <= end + step) {
+                val x = timeToX(time)
+
+                paint.color = 0xFF29382F.toInt()
+                canvas.drawLine(
+                    x, rulerHeight.toFloat(), x, height.toFloat(), paint
+                )
+
+                paint.color = MUTED
+                paint.textSize = dp(10f).toFloat()
+                canvas.drawText(
+                    rulerLabel(time, step),
+                    x + dp(3f),
+                    dp(23f).toFloat(),
+                    paint
+                )
+
+                time += step
+            }
+
+            for (track in 0 until tracks) {
+                val top = rulerHeight + track * trackHeight - panY
+
+                paint.color = if (track % 2 == 0) {
+                    if (isDarkTheme) 0xFF17223A.toInt() else 0xFFFFEFE0.toInt()
+                } else {
+
                     if (isDarkTheme) 0xFF1B2944.toInt() else 0xFFFFE7D2.toInt()
                 }
 
