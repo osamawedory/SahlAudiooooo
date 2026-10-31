@@ -330,7 +330,7 @@ class MainActivity : ComponentActivity() {
                     if (index > 0) marginStart = dp(gap.toFloat())
                 })
             }
-            addView(scrollRow(r), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(5f) })
+            root.addView(scrollRow(r), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(5f) })
         }
 
         // رأس التطبيق
@@ -2404,7 +2404,7 @@ class MainActivity : ComponentActivity() {
                     for (i in 0 until frames * channels) {
                         pcm[i] = (mix[frame * channels + i] * safeGain).toInt().coerceIn(-32768, 32767).toShort()
                     }
-                    val encoded = encoder.encodeBufferInterleaved(pcm, frames, mp3)
+                    val encoded = encoder.encodeBufferInterLeaved(pcm, frames, mp3)
                     if (encoded > 0) stream.write(mp3, 0, encoded)
                     frame += frames
                 }
