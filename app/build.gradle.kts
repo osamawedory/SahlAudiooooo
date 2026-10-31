@@ -17,5 +17,5 @@ android {
 }
 dependencies {
     implementation("androidx.activity:activity-ktx:1.10.1")
-    implementation("com.github.naman14:TAndroidLame:1.1")
+    implementation("com.github.naman14:TAndroidLame:1.1") { exclude(group = "com.android.support", module = "support-compat") }
 }
